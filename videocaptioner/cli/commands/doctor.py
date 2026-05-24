@@ -66,12 +66,19 @@ def _check_command(name: str, purpose: str) -> Check:
 
 def _check_ytdlp() -> Check:
     path = shutil.which("yt-dlp")
-    if not path:
+    if path:
+        version = _command_version("yt-dlp")
+        if version and _yt_dlp_version_is_old(version):
+            return Check("yt-dlp", "warn", f"{path} ({version}) may be old", "Update yt-dlp if online downloads fail")
+        return Check("yt-dlp", "ok", f"{path}" + (f" ({version})" if version else ""))
+    try:
+        import yt_dlp
+        import yt_dlp.version
+
+        version = getattr(yt_dlp.version, "__version__", "")
+        return Check("yt-dlp", "ok", "embedded yt_dlp module" + (f" ({version})" if version else ""))
+    except Exception:
         return Check("yt-dlp", "error", "yt-dlp not found. Required by videocaptioner download.", "Install yt-dlp and make sure it is on PATH")
-    version = _command_version("yt-dlp")
-    if version and _yt_dlp_version_is_old(version):
-        return Check("yt-dlp", "warn", f"{path} ({version}) may be old", "Update yt-dlp if online downloads fail")
-    return Check("yt-dlp", "ok", f"{path}" + (f" ({version})" if version else ""))
 
 
 def _yt_dlp_version_is_old(version: str) -> bool:
