@@ -67,7 +67,6 @@ version-file = "videocaptioner/_version.py"
 
 [tool.hatch.build.targets.sdist]
 exclude = [
-    "resource/fonts/",
     "docs/",
     "legacy-docs/",
     "work-dir/",
@@ -80,6 +79,11 @@ exclude = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["videocaptioner"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"resource/assets" = "videocaptioner/resources/assets"
+"resource/subtitle_style" = "videocaptioner/resources/subtitle_style"
+"resource/translations" = "videocaptioner/resources/translations"
 
 [tool.uv]
 environments = [

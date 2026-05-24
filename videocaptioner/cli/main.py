@@ -22,6 +22,17 @@ from typing import List, Optional
 from videocaptioner.cli import exit_codes as EXIT
 
 
+def _configure_stdio() -> None:
+    """Prefer UTF-8 CLI output, and never crash on legacy Windows encodings."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def _add_llm_options(parser: argparse.ArgumentParser) -> None:
     """Add LLM-related options shared across commands."""
     group = parser.add_argument_group("LLM options")
@@ -697,6 +708,7 @@ def _run_style(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    _configure_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
 
