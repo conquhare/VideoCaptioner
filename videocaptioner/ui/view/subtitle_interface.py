@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from PyQt5.QtCore import QAbstractTableModel, QModelIndex, Qt, QTime, pyqtSignal
-from PyQt5.QtGui import QCloseEvent, QColor, QDragEnterEvent, QDropEvent, QKeyEvent
+from PyQt5.QtGui import QBrush, QCloseEvent, QColor, QDragEnterEvent, QDropEvent, QKeyEvent
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -44,18 +44,27 @@ from videocaptioner.core.constant import (
 )
 from videocaptioner.core.entities import (
     OutputSubtitleFormatEnum,
+    ProcessStage,
+    SubtitleFailure,
     SubtitleLayoutEnum,
     SubtitleTask,
     SupportedSubtitleFormats,
 )
 from videocaptioner.core.subtitle import get_subtitle_style
 from videocaptioner.core.translate.types import TargetLanguage
+from videocaptioner.core.utils.error_classifier import FatalErrorType
 from videocaptioner.core.utils.platform_utils import open_folder, reveal_in_explorer
 from videocaptioner.ui.common.config import cfg
 from videocaptioner.ui.common.signal_bus import signalBus
 from videocaptioner.ui.components.SubtitleSettingDialog import SubtitleSettingDialog
 from videocaptioner.ui.task_factory import TaskFactory
+from videocaptioner.ui.thread.retry_thread import RetryThread
 from videocaptioner.ui.thread.subtitle_thread import RetranslateThread, SubtitleThread
+
+# 失败标注配色（浅红底 + 红字），P0 用行着色 + 文字标签，P1 再加精致角标 delegate
+_FAILURE_BG = QColor(255, 235, 238)  # 浅红底
+_FAILURE_FG = QColor(211, 47, 47)  # 红字
+_FAILURE_LABEL = "［失败］"  # 失败行在「字幕内容」列的文字标签前缀
 
 
 class SubtitleTableModel(QAbstractTableModel):
@@ -100,13 +109,49 @@ class SubtitleTableModel(QAbstractTableModel):
                     .toString("hh:mm:ss.zzz")[:-2]
                 )
             elif col == 2:
-                return segment["original_subtitle"]
+                text = segment["original_subtitle"]
+                if self._is_failed_segment(segment):
+                    text = _FAILURE_LABEL + text  # 失败行文字标签（P0）
+                return text
             elif col == 3:
                 return segment["translated_subtitle"]
         elif role == Qt.TextAlignmentRole:  # type: ignore
             if col in [0, 1]:
                 return Qt.AlignCenter  # type: ignore
+        # 失败标注：失败行浅红底 + 失败列红字 + tooltip 显示错误信息
+        elif role == Qt.BackgroundRole:  # type: ignore
+            if self._is_failed_segment(segment):
+                return QBrush(_FAILURE_BG)
+        elif role == Qt.ForegroundRole:  # type: ignore
+            if self._is_failed_segment(segment):
+                return QBrush(_FAILURE_FG)
+        elif role == Qt.ToolTipRole:  # type: ignore
+            if self._is_failed_segment(segment):
+                return self._failure_tooltip(segment)
         return None
+
+    @staticmethod
+    def _segment_failed_stages(segment: Dict[str, Any]) -> List[str]:
+        """返回该行失败的阶段值列表（如 ['optimize', 'translate']）"""
+        stages = segment.get("failed_stages")
+        return list(stages) if stages else []
+
+    @classmethod
+    def _is_failed_segment(cls, segment: Dict[str, Any]) -> bool:
+        """该行是否有任一失败阶段"""
+        return bool(cls._segment_failed_stages(segment))
+
+    @staticmethod
+    def _failure_tooltip(segment: Dict[str, Any]) -> str:
+        """构造失败行 tooltip：错误信息 + 失败阶段"""
+        stages = segment.get("failed_stages") or []
+        message = segment.get("error_message") or ""
+        parts = []
+        if stages:
+            parts.append("失败阶段: " + ", ".join(stages))
+        if message:
+            parts.append(message)
+        return "\n".join(parts)
 
     def setData(self, index: QModelIndex, value: Any, role: int = Qt.EditRole) -> bool:  # type: ignore
         if not index.isValid() or not self._data:
@@ -192,9 +237,120 @@ class SubtitleTableModel(QAbstractTableModel):
         self._data = data
         self.layoutChanged.emit()
 
+    def update_rows_full(self, new_data: Dict[str, Any]) -> None:
+        """用完整 to_json 行覆盖对应 `_data[key]`（含 failed_stages/error_message）。
+
+        与 `update_data`（仅合并 translated_subtitle）不同，本方法整行覆盖，
+        因此重试成功项的 `failed_stages` 会被清空、恢复常色；仍失败项保留失败标注。
+
+        Args:
+            new_data: {str(index): 完整 to_json 行}，键为 1-based 行号字符串。
+        """
+        affected_rows = set()
+
+        for key, value in new_data.items():
+            if key not in self._data:
+                continue
+            # 整行覆盖：保留 model 端键顺序，仅替换该行内容
+            self._data[key].update(value)
+            row = list(self._data.keys()).index(key)
+            affected_rows.add(row)
+
+        if affected_rows:
+            top_left = self.index(min(affected_rows), 0)
+            bottom_right = self.index(max(affected_rows), self.columnCount() - 1)
+            self.dataChanged.emit(
+                top_left,
+                bottom_right,
+                [
+                    Qt.DisplayRole,
+                    Qt.EditRole,
+                    Qt.BackgroundRole,
+                    Qt.ForegroundRole,
+                    Qt.ToolTipRole,
+                ],  # type: ignore
+            )
+
+    def set_failure_markers(
+        self,
+        indices: List[int],
+        stage: ProcessStage,
+        message: str = "",
+        clear: bool = False,
+    ) -> None:
+        """批量把失败标注写入 `_data[key]["failed_stages"]` 并局部刷新对应行。
+
+        Args:
+            indices: 受影响的字幕 index（1-based）。
+            stage: 失败阶段（optimize/translate/split）。
+            message: 错误信息，写入 error_message 供 tooltip 显示。
+            clear: 为 True 时清除（而非写入）该阶段失败标记（用于重试成功后）。
+        """
+        stage_value = stage.value if isinstance(stage, ProcessStage) else str(stage)
+        affected_rows = set()
+
+        for idx in indices:
+            key = str(idx)  # model._data 用字符串 key
+            segment = self._data.get(key)
+            if not segment:
+                continue
+            stages = set(segment.get("failed_stages") or [])
+            if clear:
+                stages.discard(stage_value)
+                if not stages:
+                    segment["error_message"] = ""
+            else:
+                stages.add(stage_value)
+                if message:
+                    segment["error_message"] = message
+            segment["failed_stages"] = sorted(stages)
+
+            row = list(self._data.keys()).index(key)
+            affected_rows.add(row)
+
+        if affected_rows:
+            top_left = self.index(min(affected_rows), 0)
+            bottom_right = self.index(max(affected_rows), self.columnCount() - 1)
+            self.dataChanged.emit(
+                top_left,
+                bottom_right,
+                [Qt.DisplayRole, Qt.BackgroundRole, Qt.ForegroundRole, Qt.ToolTipRole],  # type: ignore
+            )
+
+    def collect_failures(self) -> Dict[ProcessStage, List[int]]:
+        """从 `_data` 按 failed_stages 归类出各阶段失败 index（1-based，升序）。
+
+        供「重试全部失败项」收集待重发字幕。
+        """
+        failures: Dict[ProcessStage, List[int]] = {}
+        for key, segment in self._data.items():
+            for stage_value in segment.get("failed_stages") or []:
+                try:
+                    stage = ProcessStage(stage_value)
+                except ValueError:
+                    continue
+                indices = failures.setdefault(stage, [])
+                index = int(key)
+                if index not in indices:
+                    indices.append(index)
+        for indices in failures.values():
+            indices.sort()
+        return failures
+
+    def count_failures(self) -> int:
+        """当前失败字幕总数（按行去重，一行可能失败于多个阶段）。"""
+        return sum(
+            1
+            for segment in self._data.values()
+            if segment.get("failed_stages")
+        )
+
 
 class SubtitleInterface(QWidget):
     finished = pyqtSignal(str, str)
+    # 请求重试信号：批量（indices 为空表示全部失败项）或单条（带 stage）。
+    # 本次 T04 只做 UI 入口 + 信号，实际重试由 T03/T05 的 RetryThread 承接并接线本信号。
+    retry_requested = pyqtSignal(object, object)  # (List[int], Optional[ProcessStage])
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -202,11 +358,15 @@ class SubtitleInterface(QWidget):
         self.task: Optional[SubtitleTask] = None
         self.subtitle_path: Optional[str] = None
         self.custom_prompt_text: str = cfg.custom_prompt_text.value
+        # 鉴权/欠费致命错误后禁用重试（重试无意义），恢复需重新加载/改配置
+        self._retry_disabled_by_auth = False
         self.setAttribute(Qt.WA_DeleteOnClose)  # type: ignore
         self._init_ui()
         self._setup_signals()
         self._update_prompt_button_style()
         self.set_values()
+        # 接线手动重试信号 → spawn RetryThread（T05 核心）
+        self.retry_requested.connect(self._on_retry_requested)
 
     def _init_ui(self):
         self.main_layout = QVBoxLayout(self)
@@ -345,7 +505,22 @@ class SubtitleInterface(QWidget):
             lambda: self.start_subtitle_optimization(need_create_task=True)
         )
         self.start_button.setFixedHeight(34)
+        # 悬浮提示：说明断点续跑与失败重试行为
+        self.start_button.setToolTip(
+            self.tr(
+                "开始字幕校正/翻译。\n"
+                "· 每批完成即写入检查点(<输出名>.checkpoint.srt)，中断后可从检查点续跑；\n"
+                "· 失败条目会先整体跑一遍，末尾再对失败项减半批统一重试，仍失败则保留占位，可稍后在此界面手动重试。"
+            )
+        )
         top_layout.addWidget(self.start_button)
+
+        # 「重试全部失败项(N)」按钮：无失败时隐藏，N 动态 = 当前失败总数
+        self.retry_all_button = PushButton(self.tr("重试全部失败项"), self, icon=FIF.SYNC)
+        self.retry_all_button.setFixedHeight(34)
+        self.retry_all_button.hide()
+        self.retry_all_button.clicked.connect(self.retry_all_failed)
+        top_layout.addWidget(self.retry_all_button)
 
         self.main_layout.addLayout(top_layout)
 
@@ -445,6 +620,8 @@ class SubtitleInterface(QWidget):
         self.model._data = asr_data.to_json()
         self.model.layoutChanged.emit()
         self.status_label.setText(self.tr("已加载文件"))
+        self._retry_disabled_by_auth = False  # 新任务恢复重试能力
+        self._update_retry_all_button()
 
     def start_subtitle_optimization(self, need_create_task: bool = True) -> None:
         if self._is_processing():
@@ -458,6 +635,7 @@ class SubtitleInterface(QWidget):
             )
             return
         self.start_button.setEnabled(False)
+        self.retry_all_button.setEnabled(False)  # 重试期间置灰，避免并发数据竞争
         self.progress_bar.resume()
         self.progress_bar.reset()
         self.cancel_button.show()
@@ -483,6 +661,13 @@ class SubtitleInterface(QWidget):
         self.subtitle_optimization_thread.error.connect(
             self.on_subtitle_optimization_error
         )
+        # 主流程实时失败反馈：逐条降级标注 + 致命错误按类型定制
+        self.subtitle_optimization_thread.degraded.connect(
+            self._on_processing_degraded
+        )
+        self.subtitle_optimization_thread.fatal.connect(
+            self._on_processing_fatal
+        )
         self.subtitle_optimization_thread.set_custom_prompt_text(
             self.custom_prompt_text
         )
@@ -505,6 +690,7 @@ class SubtitleInterface(QWidget):
         self.start_button.setEnabled(True)
         self.cancel_button.hide()
         self.progress_bar.setValue(100)
+        self._update_retry_all_button()  # 优化结束后按失败数恢复/显示重试按钮
         if self.task and self.task.need_next_task:
             self.finished.emit(video_path, output_path)
         InfoBar.success(
@@ -519,6 +705,7 @@ class SubtitleInterface(QWidget):
         self.start_button.setEnabled(True)
         self.cancel_button.hide()  # 隐藏取消按钮
         self.progress_bar.error()
+        self._update_retry_all_button()
         InfoBar.error(
             self.tr("优化失败"),
             self.tr(error),
@@ -530,11 +717,136 @@ class SubtitleInterface(QWidget):
         self.progress_bar.setValue(value)
         self.status_label.setText(status)
 
+    def _on_processing_degraded(self, failures) -> None:
+        """主流程/重试线程实时降级反馈：把失败标注写入表格（变红 + ［失败］）。
+
+        Args:
+            failures: List[SubtitleFailure]，逐条（或汇总）失败记录。
+        """
+        for f in failures:
+            self.model.set_failure_markers(f.indices, f.stage, message=f.message)
+        self._update_retry_all_button()
+
+    def _on_processing_fatal(self, error_text: str, fatal_type: str) -> None:
+        """主流程致命错误：按 FatalErrorType 定制文案；鉴权/欠费时禁用重试。
+
+        Args:
+            error_text: 错误详情文本。
+            fatal_type: FatalErrorType.value（如 "auth_quota"）。
+        """
+        InfoBar.error(
+            self.tr("处理失败"),
+            self.tr(error_text),
+            duration=INFOBAR_DURATION_ERROR,
+            parent=self,
+        )
+        if fatal_type == FatalErrorType.AUTH_QUOTA.value:
+            # 403/欠费/余额不足：重试无意义，禁用全部重试入口
+            self._retry_disabled_by_auth = True
+            self.retry_all_button.hide()
+            InfoBar.warning(
+                self.tr("无法重试"),
+                self.tr("检测到鉴权/欠费错误，请检查 API 配置后重新加载字幕"),
+                duration=INFOBAR_DURATION_WARNING,
+                parent=self,
+            )
+
     def update_data(self, data):
         self.model.update_data(data)
+        self._update_retry_all_button()
 
     def update_all(self, data):
         self.model.update_all(data)
+        self._update_retry_all_button()
+
+    def _update_retry_all_button(self) -> None:
+        """根据当前失败总数刷新「重试全部失败项(N)」按钮文案与可见性。
+
+        鉴权/欠费致命错误后（`_retry_disabled_by_auth`）强制隐藏重试入口。
+        """
+        if self._retry_disabled_by_auth:
+            self.retry_all_button.hide()
+            return
+        count = self.model.count_failures()
+        if count > 0:
+            self.retry_all_button.setText(self.tr("重试全部失败项(%d)" % count))
+            self.retry_all_button.setToolTip(self._build_retry_tooltip())
+            self.retry_all_button.show()
+            self.retry_all_button.setEnabled(not self._is_processing())
+        else:
+            self.retry_all_button.hide()
+
+    def _build_retry_tooltip(self) -> str:
+        """构造「重试全部失败项」按钮的悬浮提示：按阶段列出失败条数。
+
+        阶段顺序固定为 断句→优化→翻译；某阶段无失败则不列。
+        """
+        failures = self.model.collect_failures()
+        stage_labels = {
+            ProcessStage.SPLIT: self.tr("断句"),
+            ProcessStage.OPTIMIZE: self.tr("优化"),
+            ProcessStage.TRANSLATE: self.tr("翻译"),
+        }
+        parts = []
+        for stage in (ProcessStage.SPLIT, ProcessStage.OPTIMIZE, ProcessStage.TRANSLATE):
+            indices = failures.get(stage)
+            if indices:
+                preview = ", ".join(str(i) for i in indices[:8])
+                more = self.tr(" …等共 %d 条") % len(indices) if len(indices) > 8 else ""
+                parts.append(
+                    self.tr("· %s失败 %d 条（第 %s%s）")
+                    % (stage_labels[stage], len(indices), preview, more)
+                )
+        tip = self.tr("重试全部失败项：重新请求所有失败条目。\n") + "\n".join(parts)
+        tip += "\n" + self.tr("（也可右键单个失败行「重试此条」，仅重发该条指定阶段）")
+        return tip
+
+    def retry_all_failed(self) -> None:
+        """「重试全部失败项」入口：收集各阶段失败 index 并发出 retry_requested 信号。
+
+        本次只做 UI 入口 + 信号，实际重试由 T03/T05 的 RetryThread 承接并接线
+        `retry_requested` 信号。批量重试建议强制串行或小并发 + 批间退避（见架构 §4.5）。
+        """
+        if self._is_processing():
+            return
+        failures = self.model.collect_failures()
+        if not failures:
+            InfoBar.info(
+                self.tr("无需重试"),
+                self.tr("当前没有失败项"),
+                duration=INFOBAR_DURATION_INFO,
+                parent=self,
+            )
+            return
+        # 置灰，避免并发数据竞争；重试线程完成回填后由 T05 恢复
+        self.retry_all_button.setEnabled(False)
+        total = sum(len(indices) for indices in failures.values())
+        InfoBar.info(
+            self.tr("开始重试"),
+            self.tr("正在重试 %d 项失败字幕..." % total),
+            duration=INFOBAR_DURATION_INFO,
+            parent=self,
+        )
+        # indices 为空列表表示「全部失败项」，stage 传 None 表示按 collect_failures 分类处理
+        self.retry_requested.emit([], None)
+
+    def retry_single(self, index: int, stage: ProcessStage) -> None:
+        """右键「重试此条」入口：重发单条字幕的指定失败阶段。
+
+        本次只做 UI 入口 + 信号，实际重试由 T03/T05 的 RetryThread 承接并接线
+        `retry_requested` 信号。
+        """
+        if self._is_processing():
+            return
+        self.retry_all_button.setEnabled(False)
+        stage_name = stage.value if isinstance(stage, ProcessStage) else str(stage)
+        InfoBar.info(
+            self.tr("开始重试"),
+            self.tr("正在重试第 %d 条字幕（%s）..." % (index, stage_name)),
+            duration=INFOBAR_DURATION_INFO,
+            parent=self,
+        )
+        self.retry_requested.emit([index], stage)
 
     def remove_widget(self) -> None:
         """隐藏顶部开始按钮和底部进度条"""
@@ -636,6 +948,8 @@ class SubtitleInterface(QWidget):
         self.model._data = asr_data.to_json()
         self.model.layoutChanged.emit()
         self.status_label.setText(self.tr("已加载文件"))
+        self._retry_disabled_by_auth = False  # 新文件恢复重试能力
+        self._update_retry_all_button()
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         event.accept() if event.mimeData().hasUrls() else event.ignore()
@@ -765,8 +1079,43 @@ class SubtitleInterface(QWidget):
         delete_action.triggered.connect(lambda: self.delete_selected_rows(rows))
         retranslate_action.triggered.connect(lambda: self.retranslate_selected_rows(rows))
 
+        # 失败行的「重试此条」入口：按该行 failed_stages 决定显示哪些阶段重试
+        if len(rows) == 1:
+            self._add_retry_actions_for_row(menu, rows[0])
+
         # 显示菜单
         menu.exec(self.subtitle_table.viewport().mapToGlobal(pos))
+
+    def _add_retry_actions_for_row(self, menu: RoundMenu, row: int) -> None:
+        """对失败行增加「重试此条(优化)」/「重试此条(翻译)」菜单项。
+
+        按该行 failed_stages 决定显示；点击走 retry_single 骨架（待 T05 接 RetryThread）。
+        """
+        keys = list(self.model._data.keys())
+        if row >= len(keys):
+            return
+        segment = self.model._data.get(keys[row])
+        if not segment:
+            return
+
+        failed_stages = set(segment.get("failed_stages") or [])
+        if not failed_stages or self._is_processing():
+            return
+
+        menu.addSeparator()
+        stage_map = {
+            ProcessStage.OPTIMIZE.value: (self.tr("重试此条(优化)"), ProcessStage.OPTIMIZE),
+            ProcessStage.TRANSLATE.value: (self.tr("重试此条(翻译)"), ProcessStage.TRANSLATE),
+            ProcessStage.SPLIT.value: (self.tr("重试此条(断句)"), ProcessStage.SPLIT),
+        }
+        for stage_value, (label, stage) in stage_map.items():
+            if stage_value in failed_stages:
+                retry_action = Action(FIF.SYNC, label)
+                # 用默认参数捕获当前 stage，避免闭包陷阱
+                retry_action.triggered.connect(
+                    lambda checked=False, idx=keys[row], st=stage: self.retry_single(int(idx), st)
+                )
+                menu.addAction(retry_action)
 
     def merge_selected_rows(self, rows: List[int]) -> None:
         """合并选中的字幕行"""
@@ -856,6 +1205,9 @@ class SubtitleInterface(QWidget):
             return True
         if hasattr(self, "_retranslate_thread") and self._retranslate_thread.isRunning():
             return True
+        # 重试线程也要算作处理中，否则重试期间还能再次触发重试/开始
+        if hasattr(self, "_retry_thread") and self._retry_thread.isRunning():
+            return True
         return False
 
     def retranslate_selected_rows(self, rows: List[int]) -> None:
@@ -894,6 +1246,7 @@ class SubtitleInterface(QWidget):
         self.model.update_data(result)
         self.progress_bar.setValue(100)
         self.status_label.setText(self.tr("重新翻译完成"))
+        self._update_retry_all_button()
         InfoBar.success(
             self.tr("翻译完成"),
             self.tr("已更新选中行的翻译"),
@@ -905,12 +1258,128 @@ class SubtitleInterface(QWidget):
         self.start_button.setEnabled(True)
         self.progress_bar.error()
         self.status_label.setText(self.tr("重新翻译失败"))
+        self._update_retry_all_button()
         InfoBar.error(
             self.tr("翻译失败"),
             error,
             duration=INFOBAR_DURATION_ERROR,
             parent=self,
         )
+
+    # ---- 手动重试（T05 接线）：retry_requested → RetryThread → 回填 ----
+
+    def _on_retry_requested(
+        self, indices: List[int], stage: Optional[ProcessStage]
+    ) -> None:
+        """接收 retry_requested 信号，组装失败集合并 spawn RetryThread。
+
+        Args:
+            indices: 待重试的 1-based index 列表；空列表 + stage=None 表示「全部失败项」。
+            stage: 指定阶段（单条重试）；None 表示按 collect_failures 分类批量处理。
+        """
+        if self._is_processing() or not self.model._data:
+            return
+        # 鉴权/欠费禁用后不再发起重试
+        if self._retry_disabled_by_auth:
+            InfoBar.warning(
+                self.tr("无法重试"),
+                self.tr("检测到鉴权/欠费错误，请检查 API 配置后重新加载字幕"),
+                duration=INFOBAR_DURATION_WARNING,
+                parent=self,
+            )
+            return
+
+        # 组装 failures：单条重试（stage 不为 None）用 {stage: indices}；
+        # 批量重试全部失败项（indices 为空 + stage None）用 collect_failures 结果。
+        if stage is not None:
+            failures: Dict[ProcessStage, List[int]] = {stage: list(indices)}
+        else:
+            failures = self.model.collect_failures()
+
+        if not failures:
+            InfoBar.info(
+                self.tr("无需重试"),
+                self.tr("没有可重试的失败项"),
+                duration=INFOBAR_DURATION_INFO,
+                parent=self,
+            )
+            self._update_retry_all_button()
+            return
+
+        # 重建完整 asr_data（retry_* 就地更新成功/失败状态后原样返回）
+        asr_data = ASRData.from_json(self.model._data)
+
+        # 取配置：与 retranslate 一致，从 TaskFactory 重建当前任务配置
+        subtitle_task = TaskFactory.create_subtitle_task(
+            file_path=self.subtitle_path or ""
+        )
+        config = subtitle_task.subtitle_config
+        if not config:
+            return
+
+        # 置灰所有触发入口，避免并发数据竞争
+        self.start_button.setEnabled(False)
+        self.retry_all_button.setEnabled(False)
+        self.progress_bar.resume()
+        self.progress_bar.reset()
+        self.status_label.setText(self.tr("正在重试..."))
+
+        file_name = Path(self.subtitle_path).name if self.subtitle_path else ""
+        # 单条重试（stage 明确且单 index）即时串行；批量交由 RetryThread 内部串行
+        is_single = stage is not None and len(indices) == 1
+        self._retry_thread = RetryThread(
+            asr_data,
+            failures,
+            config,
+            file_name=file_name,
+            custom_prompt=self.custom_prompt_text,
+            thread_num=1 if is_single else None,
+        )
+        self._retry_thread.progress.connect(self.on_subtitle_optimization_progress)
+        self._retry_thread.finished.connect(self._on_retry_finished)
+        self._retry_thread.degraded.connect(self._on_processing_degraded)
+        self._retry_thread.error.connect(self._on_retry_error)
+        self._retry_thread.start()
+
+    def _on_retry_finished(self, result: dict) -> None:
+        """重试线程完成：整行回填（含失败状态清除/保留）并恢复 UI。"""
+        # 用完整 to_json 行覆盖，成功项 failed_stages 清空、仍失败项保留标注
+        self.model.update_rows_full(result)
+        self.start_button.setEnabled(True)
+        self.cancel_button.hide()
+        self.progress_bar.setValue(100)
+        self.status_label.setText(self.tr("重试完成"))
+        self._update_retry_all_button()
+        InfoBar.success(
+            self.tr("重试完成"),
+            self.tr("重试完成，已更新 %d 项" % len(result)),
+            duration=INFOBAR_DURATION_SUCCESS,
+            parent=self,
+        )
+
+    def _on_retry_error(self, error_text: str, fatal_type: str) -> None:
+        """重试线程致命失败：弹错、恢复入口；鉴权/欠费时禁用重试。"""
+        self.start_button.setEnabled(True)
+        self.progress_bar.error()
+        self.status_label.setText(self.tr("重试失败"))
+        InfoBar.error(
+            self.tr("重试失败"),
+            self.tr(error_text),
+            duration=INFOBAR_DURATION_ERROR,
+            parent=self,
+        )
+        if fatal_type == FatalErrorType.AUTH_QUOTA.value:
+            self._retry_disabled_by_auth = True
+            self.retry_all_button.hide()
+            InfoBar.warning(
+                self.tr("无法重试"),
+                self.tr("检测到鉴权/欠费错误，请检查 API 配置后重新加载字幕"),
+                duration=INFOBAR_DURATION_WARNING,
+                parent=self,
+            )
+        else:
+            # 非鉴权错误：按剩余失败数恢复重试入口（可能还会再试）
+            self._update_retry_all_button()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         """处理键盘事件"""
