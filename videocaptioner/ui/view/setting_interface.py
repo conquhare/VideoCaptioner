@@ -379,7 +379,7 @@ class SettingInterface(ScrollArea):
                 config["api_base_cfg"],
                 FIF.LINK,
                 self.tr("Base URL"),
-                self.tr(f"输入 {service.value} Base URL"),
+                self.tr(f"输入 {service.value} Base URL（示例：https://域名/v1；必须含 http(s):// 协议头，且不要填写 /chat/completions，客户端会自动追加）"),
                 config["default_base"],
                 self.llmGroup,
             )
@@ -527,7 +527,7 @@ class SettingInterface(ScrollArea):
             cfg.batch_size,
             FIF.ALIGNMENT,
             self.tr("批处理大小"),
-            self.tr("每批处理字幕的数量，建议为 10 的倍数"),
+            self.tr("每批处理字幕的数量，建议为 10 的倍数（翻译与字幕校正共用）"),
             parent=self.translate_serviceGroup,
         )
 
@@ -537,7 +537,7 @@ class SettingInterface(ScrollArea):
             FIF.SPEED_HIGH,
             self.tr("线程数"),
             self.tr(
-                "请求并行处理的数量，模型服务商允许的情况下建议尽可能大，数值越大速度越快"
+                "请求并行处理的数量，模型服务商允许的情况下建议尽可能大，数值越大速度越快（翻译与字幕校正共用）"
             ),
             parent=self.translate_serviceGroup,
         )
@@ -603,8 +603,48 @@ class SettingInterface(ScrollArea):
         self.transcribeGroup.addSettingCard(self.whisperApiModelCard)
         self.transcribeGroup.addSettingCard(self.checkWhisperConnectionCard)
 
+        # 每分钟请求数上限(主动限速,翻译与字幕校正共用)
+        self.rpmLimitCard = RangeSettingCard(
+            cfg.llm_rpm_limit,
+            FIF.SPEED_HIGH,
+            self.tr("请求速率限制 (RPM)"),
+            self.tr(
+                "每分钟最大 LLM 请求数(翻译与字幕校正共用);主动匀速发车以避免触发服务端限流,默认 20"
+            ),
+            parent=self.llmGroup,
+        )
+
+        # 思考力度(reasoning_effort):控制 LLM 思考强度
+        self.reasoningEffortCard = ComboBoxSettingCard(
+            cfg.llm_reasoning_effort,
+            FIF.IOT,
+            self.tr("思考力度 (Reasoning Effort)"),
+            self.tr(
+                "控制 LLM 思考强度: none=关闭思考(最快), low/medium/high/max 思考越深越慢"
+            ),
+            parent=self.llmGroup,
+        )
+
+        # 网络重试次数:单个 LLM 请求失败/限流时的自动重试次数
+        self.maxRetriesCard = RangeSettingCard(
+            cfg.llm_max_retries,
+            FIF.SYNC,
+            self.tr("网络重试次数"),
+            self.tr(
+                "单个 LLM 请求失败/限流时的自动重试次数;数值越小单条失败越快、"
+                "整体先跑完一遍再靠批级/UI 重试兜底;默认 4"
+            ),
+            parent=self.llmGroup,
+        )
+
         # 添加LLM配置卡片
         self.llmGroup.addSettingCard(self.llmServiceCard)
+        # 添加 RPM 限速卡片
+        self.llmGroup.addSettingCard(self.rpmLimitCard)
+        # 添加网络重试次数卡片
+        self.llmGroup.addSettingCard(self.maxRetriesCard)
+        # 添加思考力度卡片
+        self.llmGroup.addSettingCard(self.reasoningEffortCard)
         # 添加OPENAI官方API链接卡片
         self.llmGroup.addSettingCard(self.openaiOfficialApiCard)
         for config in self.llm_service_configs.values():

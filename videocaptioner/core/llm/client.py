@@ -10,8 +10,8 @@ from urllib.parse import urlparse, urlunparse
 import openai
 from openai import OpenAI
 from tenacity import (
+    Retrying,
     RetryCallState,
-    retry,
     retry_if_exception_type,
     stop_after_attempt,
     wait_random_exponential,
@@ -154,6 +154,63 @@ def _get_rpm_limit() -> int:
         return 20
 
 
+# ── 网络层重试次数(单个请求失败/限流时的自动重试)──────────────────
+# 与 RPM 同样的覆盖模式：CLI 可在启动时 set_max_retries() 注入，优先于 UI 配置。
+# 默认 4(中等)，明显低于旧版硬编码的 10，使单条请求在持续失败时更快失败，
+# 交由更高层的批级/UI 重试兜底。
+_retry_lock = threading.Lock()
+_max_retries_override: Optional[int] = None
+_DEFAULT_MAX_RETRIES: int = 4
+
+
+def set_max_retries(n: Optional[int]) -> None:
+    """设置进程级网络重试次数覆盖值(优先于 UI 配置)。
+
+    供 CLI / 后台驱动脚本在启动时调用。传 None 可清除覆盖、恢复默认读取行为。
+
+    Args:
+        n: 单个请求的最大尝试次数；>=1 生效，<=0 或 None 视为不覆盖。
+    """
+    global _max_retries_override
+    with _retry_lock:
+        _max_retries_override = n if (n is not None and n >= 1) else None
+
+
+def _get_max_retries() -> int:
+    """惰性读取网络重试次数配置(避免 core 在导入期依赖 UI 配置)。
+
+    优先级：显式覆盖(set_max_retries) > UI 配置(cfg.llm_max_retries) > 默认 4。
+    """
+    with _retry_lock:
+        override = _max_retries_override
+    if override is not None:
+        return override
+    try:
+        from videocaptioner.ui.common.config import cfg
+
+        val = int(getattr(cfg, "llm_max_retries", _DEFAULT_MAX_RETRIES) or _DEFAULT_MAX_RETRIES)
+        return max(1, val)
+    except Exception:
+        return _DEFAULT_MAX_RETRIES
+
+
+def _build_retrying() -> "Retrying":
+    """按当前配置构建 tenacity.Retrying(每次调用实时读取重试次数)。
+
+    旧版把 stop=stop_after_attempt(10) 写死在 @retry 装饰器里，于导入期固化、
+    无法随配置变化。这里改为每次调用重建 Retrying，使 UI/CLI 改的重试次数能
+    在下一次请求即时生效。wait/retry/before_sleep 与旧版完全一致：
+    - 仅对 RateLimitError / EmptyResponseError 重试
+    - before_sleep_log 会触发全局 429 冷却(含 Retry-After 精确等待)
+    """
+    return Retrying(
+        stop=stop_after_attempt(_get_max_retries()),
+        wait=wait_random_exponential(multiplier=1, min=5, max=60),
+        retry=retry_if_exception_type((openai.RateLimitError, EmptyResponseError)),
+        before_sleep=before_sleep_log,
+    )
+
+
 def _acquire_token() -> None:
     """令牌桶:按 RPM 预算匀速放行,无可用令牌则等待补充。
 
@@ -241,19 +298,29 @@ def before_sleep_log(retry_state: RetryCallState) -> None:
     )
 
 
-@retry(
-    stop=stop_after_attempt(10),
-    wait=wait_random_exponential(multiplier=1, min=5, max=60),
-    retry=retry_if_exception_type((openai.RateLimitError, EmptyResponseError)),
-    before_sleep=before_sleep_log,
-)
 def _call_llm_api(
     messages: List[dict],
     model: str,
     temperature: float = 1,
     **kwargs: Any,
 ) -> Any:
-    """实际调用 LLM API（带重试）。base_url/api_key 经 **kwargs 透传，每次按调用方配置建连。"""
+    """实际调用 LLM API（带重试）。base_url/api_key 经 **kwargs 透传，每次按调用方配置建连。
+
+    重试次数在每次调用时实时读取配置（_build_retrying → _get_max_retries），
+    因此 UI/CLI 修改的「网络重试次数」能即时生效，而非旧版导入期固化的 10。
+    """
+    return _build_retrying()(
+        _call_llm_api_once, messages, model, temperature, **kwargs
+    )
+
+
+def _call_llm_api_once(
+    messages: List[dict],
+    model: str,
+    temperature: float = 1,
+    **kwargs: Any,
+) -> Any:
+    """单次 LLM 请求（无重试）。由 _call_llm_api 通过 tenacity 按当前配置驱动重试。"""
     _acquire_token()
     _wait_for_cooldown()
     base_url = kwargs.pop("base_url", "")

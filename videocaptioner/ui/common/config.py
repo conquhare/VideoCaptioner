@@ -88,6 +88,18 @@ class Config(QConfig):
     openai_model = ConfigItem("LLM", "OpenAI_Model", "gpt-4o-mini")
     openai_api_key = ConfigItem("LLM", "OpenAI_API_Key", "")
     openai_api_base = ConfigItem("LLM", "OpenAI_API_Base", "https://api.openai.com/v1")
+    # LLM 每分钟请求数上限(主动令牌桶限速,0 视为不限制)
+    llm_rpm_limit = RangeConfigItem("LLM", "RpmLimit", 20, RangeValidator(1, 1000))
+
+    # 单个 LLM 请求失败/限流时的网络层自动重试次数(默认 4,较低以便快速失败、
+    # 交由批级/UI 重试兜底)
+    llm_max_retries = RangeConfigItem("LLM", "MaxRetries", 4, RangeValidator(1, 10))
+
+    # 思考力度(reasoning_effort):控制 LLM 思考强度, none=关闭思考(最快)
+    llm_reasoning_effort = OptionsConfigItem(
+        "LLM", "ReasoningEffort", "none",
+        OptionsValidator(["none", "low", "medium", "high", "max"]),
+    )
 
     silicon_cloud_model = ConfigItem("LLM", "SiliconCloud_Model", "gpt-4o-mini")
     silicon_cloud_api_key = ConfigItem("LLM", "SiliconCloud_API_Key", "")
