@@ -142,6 +142,12 @@ def run(args: Namespace, config: dict) -> int:
     llm_model = get(config, "llm.model", "")
     reasoning_effort = get(config, "llm.reasoning_effort", "none")
 
+    # 进程级 RPM 覆盖：headless 运行读不到 UI 配置，令牌桶会默认按 20 RPM 放行，
+    # 对低 RPM 免费额度几乎必然吃 429。这里在启动时把 CLI 解析出的 rpm_limit
+    # 注入 LLM 客户端，使其在 split/optimize/translate 任一阶段都生效。
+    from videocaptioner.core.llm.client import set_rpm_override
+    set_rpm_override(int(get(config, "llm.rpm_limit", 20)))
+
     # Load custom prompt (only if LLM features are needed)
     custom_prompt = getattr(args, "prompt", None) or ""
     prompt_file = getattr(args, "prompt_file", None)

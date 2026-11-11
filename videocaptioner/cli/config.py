@@ -66,6 +66,7 @@ DEFAULTS: Dict[str, Any] = {
         "api_key": "",
         "api_base": "https://api.openai.com/v1",
         "model": "gpt-4o-mini",
+        "rpm_limit": 4,
     },
     "whisper_api": {
         "api_key": "",
