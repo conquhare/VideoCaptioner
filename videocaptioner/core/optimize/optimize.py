@@ -7,12 +7,18 @@ import atexit
 import difflib
 import re
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from contextlib import contextmanager
+from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import json_repair
 
 from ..asr.asr_data import ASRData, ASRDataSeg
-from ..entities import SubtitleProcessData
+from ..entities import (
+    ProcessStage,
+    SubtitleFailure,
+    SubtitleProcessData,
+    SubtitleStatus,
+)
 from ..llm import call_llm
 from ..prompts import get_prompt
 from ..split.alignment import SubtitleAligner
@@ -22,6 +28,9 @@ from ..utils.text_utils import count_words
 logger = setup_logger("subtitle_optimizer")
 
 MAX_STEPS = 3
+
+# 极短碎片词判定阈值：整批字幕词数都 ≤ 此值时跳过相似度校验（避免填充词删除触发无谓反馈循环）
+_SHORT_FRAGMENT_MAX_WORDS = 3
 
 
 class SubtitleOptimizer:
@@ -40,6 +49,13 @@ class SubtitleOptimizer:
         model: str,
         custom_prompt: str,
         update_callback: Optional[Callable] = None,
+        failure_callback: Optional[Callable[[SubtitleFailure], None]] = None,
+        base_url: str = "",
+        api_key: str = "",
+        reasoning_effort: str = "none",
+        checkpoint_path: Optional[str] = None,
+        checkpoint_callback: Optional[Callable[[ASRData], None]] = None,
+        retry_chunk_size: Optional[int] = None,
     ):
         """初始化优化器
 
@@ -50,12 +66,34 @@ class SubtitleOptimizer:
             custom_prompt: 自定义优化提示词
             temperature: LLM温度参数
             update_callback: 进度更新回调函数
+            failure_callback: 降级失败上报回调（与 update_callback 对称），为 None 时静默
+            base_url: LLM API 基础 URL（显式传参，取代旧的进程级 env 方案）
+            api_key: LLM API 密钥
+            checkpoint_path: 检查点文件路径（可选，仅供记录，实际落盘由 checkpoint_callback 负责）
+            checkpoint_callback: 每批完成后回调，接收当前 in-progress ASRData 并落盘（增量检查点）
+            retry_chunk_size: 统一重试时的批次大小；None 时取 max(1, batch_num // 2)
         """
         self.thread_num = thread_num
         self.batch_num = batch_num
         self.model = model
         self.custom_prompt = custom_prompt
+        self.base_url = base_url
+        self.api_key = api_key
+        self.reasoning_effort = reasoning_effort
         self.update_callback = update_callback
+        self.failure_callback = failure_callback
+        self.checkpoint_path = checkpoint_path
+        self.checkpoint_callback = checkpoint_callback
+        self.retry_chunk_size = retry_chunk_size
+        # 当前正在优化的 segment 列表（1-based index → segments[i-1]），
+        # 供降级点就地标注 process_status；由 optimize_subtitle / retry_optimize 设置
+        self._current_segments: List[ASRDataSeg] = []
+        # 两击失败计数：全局 1-based index → 累计失败次数（跨初始 pass 与统一重试持久）
+        self._failure_counts: Dict[int, int] = {}
+        # 批次编号映射：全局 1-based index → "batch_id_intra_seq"（如 "1_5"），仅用于日志/检查点追踪
+        self._index_to_batch_key: Dict[int, str] = {}
+        # 工作集：全局 1-based index → 当前已知最优优化文本（失败项保留原文），用于重建检查点
+        self._working_optimized: Dict[int, str] = {}
 
         self.is_running = True
         self.executor: Optional[ThreadPoolExecutor] = None
@@ -82,6 +120,13 @@ class SubtitleOptimizer:
             else:
                 asr_data = subtitle_data
 
+            # 记录当前 segment 列表，供降级点标注失败状态
+            self._current_segments = asr_data.segments
+
+            # 重置两击计数与工作集（每次全新 optimize pass 从零开始；统一重试不重置）
+            self._failure_counts = {}
+            self._working_optimized = {}
+
             # 转换为字典格式
             subtitle_dict = {
                 str(i): seg.text for i, seg in enumerate(asr_data.segments, 1)
@@ -93,14 +138,162 @@ class SubtitleOptimizer:
             # 并行优化
             optimized_dict = self._parallel_optimize(chunks)
 
-            # 创建新segments
-            new_segments = self._create_segments(asr_data.segments, optimized_dict)
+            # 折叠到工作集，供检查点重建
+            for k, v in optimized_dict.items():
+                self._working_optimized[int(k)] = v
 
-            return ASRData(new_segments)
+            # 用初始 pass 的结果构建新的 segment 列表，供统一重试就地更新
+            asr_data = ASRData(self._create_segments(asr_data.segments, optimized_dict))
+
+            # 统一重试（单次，不再递归）：对初始 pass 失败的 segments 用更小批次重试一次
+            failed_indices = self.get_failed_indices(min_strikes=1)
+            if failed_indices:
+                retry_chunk = self.retry_chunk_size or max(1, self.batch_num // 2)
+                with self._override_batch_num(retry_chunk):
+                    asr_data = self.retry_optimize(asr_data, failed_indices)
+
+            return asr_data
 
         except Exception as e:
             logger.error(f"Optimization failed: {str(e)}")
             raise RuntimeError(f"Optimization failed: {str(e)}")
+
+    def retry_optimize(
+        self,
+        asr_data: ASRData,
+        indices: List[int],
+        thread_num: Optional[int] = None,
+    ) -> ASRData:
+        """只重试指定 index 的优化；成功项原样保留（幂等）。
+
+        幂等铁律：仅 indices 对应的字幕进入 LLM 请求，成功项文本不重算/不覆盖。
+        成功 → 更新文本 + process_status[OPTIMIZE]=SUCCESS；
+        仍失败 → 保持 FAILED 并再次通过 failure_callback 上报。
+
+        Args:
+            asr_data: 完整字幕数据（就地更新并原样返回）
+            indices: 需要重试的字幕 index（1-based）
+            thread_num: 可选并发度覆盖（重试建议串行或小并发）
+
+        Returns:
+            更新后的 ASRData（同一对象）
+        """
+        target_indices = sorted({int(i) for i in indices})
+        if not target_indices:
+            return asr_data
+
+        segments = asr_data.segments
+        self._current_segments = segments
+
+        with self._override_thread_num(thread_num):
+            # 标记为重试中，用于区分「本次运行失败」与「历史失败」
+            for i in target_indices:
+                segments[i - 1].process_status[ProcessStage.OPTIMIZE] = (
+                    SubtitleStatus.RETRYING
+                )
+
+            # 构造仅含失败项的子集（键为原 1-based index），成功项不参与
+            sub_dict = {str(i): segments[i - 1].text for i in target_indices}
+            chunks = self._split_chunks(sub_dict)
+            optimized_dict = self._parallel_optimize(chunks)
+
+            # 回填：本次运行中仍为 FAILED 的保持失败（已在降级点上报），其余视为成功
+            for i in target_indices:
+                seg = segments[i - 1]
+                seg.text = optimized_dict.get(str(i), seg.text)
+                if seg.process_status.get(ProcessStage.OPTIMIZE) == SubtitleStatus.FAILED:
+                    continue
+                seg.process_status[ProcessStage.OPTIMIZE] = SubtitleStatus.SUCCESS
+                seg.error_message = ""
+
+        return asr_data
+
+    def _mark_optimize_failed(self, indices: List[int], message: str) -> None:
+        """就地标注优化失败状态并上报（core 层只调回调，不依赖 UI）。
+
+        同时累加两击失败计数，供统一重试与最终占位判定使用。
+        """
+        for idx in indices:
+            # 累加失败次数（跨初始 pass 与统一重试持久，不在此重置）
+            self._failure_counts[idx] = self._failure_counts.get(idx, 0) + 1
+            if 1 <= idx <= len(self._current_segments):
+                seg = self._current_segments[idx - 1]
+                seg.process_status[ProcessStage.OPTIMIZE] = SubtitleStatus.FAILED
+                seg.error_message = message
+        if self.failure_callback:
+            self.failure_callback(
+                SubtitleFailure(
+                    indices=indices, stage=ProcessStage.OPTIMIZE, message=message
+                )
+            )
+
+    def get_failed_indices(self, min_strikes: int = 2) -> List[int]:
+        """返回累计失败次数 ≥ min_strikes 的全局 1-based index（升序）。
+
+        Args:
+            min_strikes: 失败次数阈值。默认 2（初始 pass + 统一重试均失败 = 永久占位）；
+                         传 1 可取「至少失败过一次」的集合（用于触发统一重试）。
+        """
+        return sorted(i for i, c in self._failure_counts.items() if c >= min_strikes)
+
+    def _build_current_asr(self) -> ASRData:
+        """根据 _current_segments + 当前工作集重建一份 in-progress ASRData（供检查点落盘）。
+
+        失败项保留原文（工作集里失败项已是原文），输出仍为常规顺序时间戳，
+        batch_intra 仅作内部追踪，不体现在此 ASRData 的编号上。
+        """
+        segments = [
+            ASRDataSeg(
+                text=self._working_optimized.get(i, seg.text),
+                start_time=seg.start_time,
+                end_time=seg.end_time,
+            )
+            for i, seg in enumerate(self._current_segments, 1)
+        ]
+        return ASRData(segments)
+
+    def _invoke_checkpoint(self) -> None:
+        """尽力写检查点：IO 失败仅告警，绝不中断主流程。"""
+        if not self.checkpoint_callback:
+            return
+        try:
+            self.checkpoint_callback(self._build_current_asr())
+        except Exception as e:  # 检查点 IO 失败不应影响主流程
+            logger.warning(f"写入检查点失败（已忽略）: {str(e)}")
+
+    @contextmanager
+    def _override_thread_num(self, thread_num: Optional[int]) -> Iterator[None]:
+        """临时覆盖并发度（重试专用），退出时恢复原并发度并重建线程池。"""
+        if not thread_num or thread_num == self.thread_num:
+            yield
+            return
+
+        original = self.thread_num
+        self.thread_num = thread_num
+        if self.executor:
+            self.executor.shutdown(wait=False, cancel_futures=True)
+        self.executor = ThreadPoolExecutor(max_workers=thread_num)
+        try:
+            yield
+        finally:
+            self.thread_num = original
+            if self.executor:
+                self.executor.shutdown(wait=False, cancel_futures=True)
+            self.executor = ThreadPoolExecutor(max_workers=original)
+
+    @contextmanager
+    def _override_batch_num(self, batch_num: Optional[int]) -> Iterator[None]:
+        """临时覆盖批次大小（统一重试专用，用更小批次提高 LLM 成功率），退出时恢复。"""
+        if not batch_num or batch_num == self.batch_num:
+            yield
+            return
+
+        original = self.batch_num
+        self.batch_num = batch_num
+        try:
+            yield
+        finally:
+            self.batch_num = original
 
     def _split_chunks(self, subtitle_dict: Dict[str, str]) -> List[Dict[str, str]]:
         """将字幕字典分割成批次
@@ -129,6 +322,12 @@ class SubtitleOptimizer:
         if not self.executor:
             raise ValueError("Thread pool not initialized")
 
+        # 构建批次编号映射（1-based batch_id + 1-based intra_seq），仅用于日志/检查点追踪
+        self._index_to_batch_key = {}
+        for batch_id, chunk in enumerate(chunks, 1):
+            for intra_seq, key in enumerate(chunk.keys(), 1):
+                self._index_to_batch_key[int(key)] = f"{batch_id}_{intra_seq}"
+
         futures = []
         optimized_dict: Dict[str, str] = {}
 
@@ -145,9 +344,28 @@ class SubtitleOptimizer:
             try:
                 result = future.result()
                 optimized_dict.update(result)
+                # 折叠到工作集（成功项为优化文本，优雅失败项为原文），随后尽力写检查点
+                for k, v in result.items():
+                    self._working_optimized[int(k)] = v
             except Exception as e:
                 logger.error(f"Optimization batch failed: {str(e)}")
+                # 降级：对该批所有 index 标注失败并上报，仍保留原文继续
+                failed_indices = [int(k) for k in chunk]
+                batch_keys = [
+                    self._index_to_batch_key.get(i, str(i)) for i in failed_indices
+                ]
+                message = f"{e} (batch {batch_keys[0]}..{batch_keys[-1]})"
+                logger.warning(
+                    f"优化批次失败 (batch {batch_keys[0]}..{batch_keys[-1]}): "
+                    f"{failed_indices}"
+                )
+                self._mark_optimize_failed(failed_indices, message)
                 optimized_dict.update(chunk)  # 失败时保留原文
+                for k, v in chunk.items():
+                    self._working_optimized[int(k)] = v
+
+            # 每个批次完成（无论成功或优雅失败）后尽力写检查点
+            self._invoke_checkpoint()
 
         return optimized_dict
 
@@ -182,6 +400,16 @@ class SubtitleOptimizer:
 
         except Exception as e:
             logger.error(f"Optimization failed: {str(e)}")
+            # 降级：标注该批所有 index 失败并上报，返回原文继续
+            failed_indices = [int(k) for k in subtitle_chunk]
+            batch_keys = [
+                self._index_to_batch_key.get(i, str(i)) for i in failed_indices
+            ]
+            message = f"{e} (batch {batch_keys[0]}..{batch_keys[-1]})"
+            logger.warning(
+                f"优化批次失败 (batch {batch_keys[0]}..{batch_keys[-1]}): {failed_indices}"
+            )
+            self._mark_optimize_failed(failed_indices, message)
             return subtitle_chunk
 
     def agent_loop(self, subtitle_chunk: Dict[str, str]) -> Dict[str, str]:
@@ -223,6 +451,9 @@ class SubtitleOptimizer:
                 messages=messages,
                 model=self.model,
                 temperature=0.2,
+                base_url=self.base_url,
+                api_key=self.api_key,
+                reasoning_effort=self.reasoning_effort,
             )
 
             result_text = response.choices[0].message.content
@@ -307,6 +538,12 @@ class SubtitleOptimizer:
             return False, error_msg
 
         # 检查改动是否过大（逐条比较相似度）
+        # 极短碎片词（≤3词）跳过相似度校验：它们的"优化"无非是删填充词/首字母大写，
+        # 与系统提示词要求一致，difflib 相似度对空串/大写极敏感（'Hmm.'→'' 算 0%），
+        # 重试只会逼模型把填充词加回去，浪费请求额度并加剧限流。直接采纳首次结果。
+        if all(count_words(v) <= _SHORT_FRAGMENT_MAX_WORDS for v in original_chunk.values()):
+            return True, ""
+
         excessive_changes = []
         for key in expected_keys:
             original_text = original_chunk[key]

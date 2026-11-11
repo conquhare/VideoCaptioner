@@ -136,14 +136,11 @@ def run(args: Namespace, config: dict) -> int:
     if err is not None:
         return err
 
-    # Setup LLM environment
+    # LLM 凭据（显式传参给各 LLM 组件，不再写进程级 env）
     llm_api_key = get(config, "llm.api_key", "")
     llm_api_base = get(config, "llm.api_base", "")
     llm_model = get(config, "llm.model", "")
-    if llm_api_key:
-        os.environ["OPENAI_API_KEY"] = llm_api_key
-    if llm_api_base:
-        os.environ["OPENAI_BASE_URL"] = llm_api_base
+    reasoning_effort = get(config, "llm.reasoning_effort", "none")
 
     # Load custom prompt (only if LLM features are needed)
     custom_prompt = getattr(args, "prompt", None) or ""
@@ -181,6 +178,27 @@ def run(args: Namespace, config: dict) -> int:
             pct = min(int(_done_count / _total_count * 100), 95)
             progress.update(pct)
 
+    # 布局 + 检查点路径（在管线前确定，供 checkpoint_callback 复用）
+    from videocaptioner.cli.validators import resolve_layout
+    layout = resolve_layout(layout_str)
+
+    checkpoint_path = None
+    checkpoint_callback = None
+    if need_optimize or need_translate:
+        out_p = Path(output_path)
+        checkpoint_path = str(out_p.with_name(f"{out_p.stem}.checkpoint.srt"))
+
+        def checkpoint_callback(data):
+            """尽力把 in-progress ASRData 落盘为检查点（IO 失败仅告警，不中断主流程）。
+
+            检查点为中间产物：不 remove_punctuation，输出仍为常规顺序时间戳。
+            """
+            try:
+                data.save(save_path=checkpoint_path, layout=layout)
+            except Exception as e:  # 检查点失败不影响主流程
+                if not quiet:
+                    output.warn(f"Checkpoint save failed: {output.clean_error(str(e))}")
+
     try:
         # 1. Split (if word-level timestamps available)
         if need_split and asr_data.is_word_timestamp():
@@ -192,6 +210,9 @@ def run(args: Namespace, config: dict) -> int:
                 model=llm_model,
                 max_word_count_cjk=max_cjk,
                 max_word_count_english=max_english,
+                base_url=llm_api_base,
+                api_key=llm_api_key,
+                reasoning_effort=reasoning_effort,
             )
             asr_data = splitter.split_subtitle(asr_data)
 
@@ -206,6 +227,10 @@ def run(args: Namespace, config: dict) -> int:
                 model=llm_model,
                 custom_prompt=custom_prompt,
                 update_callback=callback,
+                base_url=llm_api_base,
+                api_key=llm_api_key,
+                reasoning_effort=reasoning_effort,
+                checkpoint_callback=checkpoint_callback,
             )
             asr_data = optimizer.optimize_subtitle(asr_data)
             asr_data.remove_punctuation()
@@ -234,13 +259,28 @@ def run(args: Namespace, config: dict) -> int:
                 custom_prompt=custom_prompt,
                 is_reflect=need_reflect,
                 update_callback=callback,
+                base_url=llm_api_base,
+                api_key=llm_api_key,
+                reasoning_effort=reasoning_effort,
+                checkpoint_callback=checkpoint_callback,
             )
             asr_data = translator.translate_subtitle(asr_data)
             asr_data.remove_punctuation()
 
         # 4. Save
-        from videocaptioner.cli.validators import resolve_layout
-        layout = resolve_layout(layout_str)
+        # 汇总两击失败（初始 pass + 统一重试均失败 = 永久占位，保留原文）的 segment 数量
+        two_strike_failures: list[int] = []
+        if need_optimize and "optimizer" in locals():
+            two_strike_failures.extend(optimizer.get_failed_indices(min_strikes=2))
+        if need_translate and "translator" in locals():
+            two_strike_failures.extend(translator.get_failed_indices(min_strikes=2))
+        two_strike_failures = sorted(set(two_strike_failures))
+        if two_strike_failures and not quiet:
+            output.warn(
+                f"{len(two_strike_failures)} segment(s) failed after retry and kept "
+                f"original text: {two_strike_failures}"
+            )
+
         asr_data.save(save_path=output_path, layout=layout)
 
         if progress:

@@ -26,6 +26,10 @@ class TranslatorFactory:
         custom_prompt: str = "",
         is_reflect: bool = False,
         update_callback: Optional[Callable] = None,
+        base_url: str = "",
+        api_key: str = "",
+        reasoning_effort: str = "none",
+        checkpoint_callback: Optional[Callable] = None,
     ) -> BaseTranslator:
         """创建翻译器实例"""
         try:
@@ -34,7 +38,7 @@ class TranslatorFactory:
                 target_language = TargetLanguage.SIMPLIFIED_CHINESE
 
             if translator_type == TranslatorType.OPENAI:
-                return LLMTranslator(
+                translator: BaseTranslator = LLMTranslator(
                     thread_num=thread_num,
                     batch_num=batch_num,
                     target_language=target_language,
@@ -42,10 +46,13 @@ class TranslatorFactory:
                     custom_prompt=custom_prompt,
                     is_reflect=is_reflect,
                     update_callback=update_callback,
+                    base_url=base_url,
+                    api_key=api_key,
+                    reasoning_effort=reasoning_effort,
                 )
             elif translator_type == TranslatorType.GOOGLE:
                 batch_num = 5
-                return GoogleTranslator(
+                translator = GoogleTranslator(
                     thread_num=thread_num,
                     batch_num=batch_num,
                     target_language=target_language,
@@ -54,7 +61,7 @@ class TranslatorFactory:
                 )
             elif translator_type == TranslatorType.BING:
                 batch_num = 10
-                return BingTranslator(
+                translator = BingTranslator(
                     thread_num=thread_num,
                     batch_num=batch_num,
                     target_language=target_language,
@@ -62,13 +69,32 @@ class TranslatorFactory:
                 )
             elif translator_type == TranslatorType.DEEPLX:
                 batch_num = 5
-                return DeepLXTranslator(
+                translator = DeepLXTranslator(
                     thread_num=thread_num,
                     batch_num=batch_num,
                     target_language=target_language,
                     timeout=20,
                     update_callback=update_callback,
                 )
+            else:
+                translator = LLMTranslator(
+                    thread_num=thread_num,
+                    batch_num=batch_num,
+                    target_language=target_language,
+                    model=model,
+                    custom_prompt=custom_prompt,
+                    is_reflect=is_reflect,
+                    update_callback=update_callback,
+                    base_url=base_url,
+                    api_key=api_key,
+                    reasoning_effort=reasoning_effort,
+                )
+
+            # 统一注入检查点回调（各子类经 BaseTranslator 读取 self.checkpoint_callback）
+            if checkpoint_callback is not None:
+                translator.checkpoint_callback = checkpoint_callback
+
+            return translator
         except Exception as e:
             logger.error(f"Failed to create translator: {str(e)}")
             raise
