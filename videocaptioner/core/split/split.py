@@ -94,6 +94,9 @@ class SubtitleSplitter:
         model,
         max_word_count_cjk: int = MAX_WORD_COUNT_CJK,
         max_word_count_english: int = MAX_WORD_COUNT_ENGLISH,
+        base_url: str = "",
+        api_key: str = "",
+        reasoning_effort: str = "none",
     ):
         """初始化分割器
 
@@ -102,11 +105,16 @@ class SubtitleSplitter:
             model: LLM模型名称
             max_word_count_cjk: CJK最大字数
             max_word_count_english: 英文最大单词数
+            base_url: LLM API 基础 URL（显式传参，取代旧的进程级 env 方案）
+            api_key: LLM API 密钥
         """
         self.thread_num = thread_num
         self.model = model
         self.max_word_count_cjk = max_word_count_cjk
         self.max_word_count_english = max_word_count_english
+        self.base_url = base_url
+        self.api_key = api_key
+        self.reasoning_effort = reasoning_effort
         self.is_running = True
         self._init_thread_pool()
 
@@ -293,6 +301,9 @@ class SubtitleSplitter:
             model=self.model,
             max_word_count_cjk=self.max_word_count_cjk,
             max_word_count_english=self.max_word_count_english,
+            base_url=self.base_url,
+            api_key=self.api_key,
+            reasoning_effort=self.reasoning_effort,
         )
 
         return self._merge_segments_based_on_sentences(segments, sentences)

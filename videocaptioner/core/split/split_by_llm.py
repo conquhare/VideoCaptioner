@@ -17,6 +17,9 @@ def split_by_llm(
     model: str = "gpt-4o-mini",
     max_word_count_cjk: int = 18,
     max_word_count_english: int = 12,
+    base_url: str = "",
+    api_key: str = "",
+    reasoning_effort: str = "none",
 ) -> List[str]:
     """使用LLM进行文本断句（固定使用句子Segments）
 
@@ -25,13 +28,21 @@ def split_by_llm(
         model: LLM模型名称
         max_word_count_cjk: 中文最大字符数
         max_word_count_english: 英文最大单词数
+        base_url: LLM API 基础 URL（显式传参，取代旧的进程级 env 方案）
+        api_key: LLM API 密钥
 
     Returns:
         断句后的文本列表
     """
     try:
         return _split_with_agent_loop(
-            text, model, max_word_count_cjk, max_word_count_english
+            text,
+            model,
+            max_word_count_cjk,
+            max_word_count_english,
+            base_url,
+            api_key,
+            reasoning_effort=reasoning_effort,
         )
     except Exception as e:
         logger.error(f"Sentence splitting failed: {e}")
@@ -43,6 +54,9 @@ def _split_with_agent_loop(
     model: str,
     max_word_count_cjk: int,
     max_word_count_english: int,
+    base_url: str = "",
+    api_key: str = "",
+    reasoning_effort: str = "none",
 ) -> List[str]:
     """使用agent loop 建立反馈循环进行文本断句，自动验证和修正"""
     prompt_path = "split/sentence"
@@ -68,6 +82,9 @@ def _split_with_agent_loop(
             messages=messages,
             model=model,
             temperature=0.1,
+            base_url=base_url,
+            api_key=api_key,
+            reasoning_effort=reasoning_effort,
         )
 
         result_text = response.choices[0].message.content
@@ -204,11 +221,3 @@ def _validate_split_result(
         return False, error_msg
 
     return True, ""
-
-
-if __name__ == "__main__":
-    sample_text = "大家好我叫杨玉溪来自有着良好音乐氛围的福建厦门自记事起我眼中的世界就是朦胧的童话书是各色杂乱的线条电视机是颜色各异的雪花小伙伴是只听其声不便骑行的马赛克后来我才知道这是一种眼底黄斑疾病虽不至于失明但终身无法治愈"
-    sentences = split_by_llm(sample_text)
-    print(f"断句结果 ({len(sentences)} 段):")
-    for i, seg in enumerate(sentences, 1):
-        print(f"  {i}. {seg}")
