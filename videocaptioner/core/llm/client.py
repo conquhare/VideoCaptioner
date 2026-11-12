@@ -194,6 +194,34 @@ def _get_max_retries() -> int:
         return _DEFAULT_MAX_RETRIES
 
 
+# ── 单请求超时(秒)──────────────────────────────────────────────
+# OpenAI SDK 默认 timeout=600s(10 分钟),过载端点会把每个请求拖满 10 分钟才报错,
+# 导致批量任务整体耗时失控。默认改为 120s,让过载请求快速失败,交由上层
+# checkpoint 持久化 + 重试机制兜底。与 RPM/重试次数同样的惰性读取模式:
+# 每次构建 client 时实时读取配置,UI/CLI 改值后下一次请求即时生效。
+_DEFAULT_REQUEST_TIMEOUT: int = 120
+_MIN_REQUEST_TIMEOUT: int = 10
+
+
+def _get_request_timeout() -> float:
+    """惰性读取单请求超时配置(秒),避免 core 在导入期依赖 UI 配置。
+
+    保护逻辑：
+    - 读取 cfg.llm_request_timeout,默认 120
+    - 非法/缺失/0/负值一律回退到默认 120
+    - 合法值强制不低于 _MIN_REQUEST_TIMEOUT(10s),防止误填过小导致所有请求失败
+    """
+    try:
+        from videocaptioner.ui.common.config import cfg
+
+        val = float(getattr(cfg, "llm_request_timeout", _DEFAULT_REQUEST_TIMEOUT) or _DEFAULT_REQUEST_TIMEOUT)
+    except Exception:
+        return float(_DEFAULT_REQUEST_TIMEOUT)
+    if val < _MIN_REQUEST_TIMEOUT:
+        return float(_DEFAULT_REQUEST_TIMEOUT)
+    return val
+
+
 def _build_retrying() -> "Retrying":
     """按当前配置构建 tenacity.Retrying(每次调用实时读取重试次数)。
 
@@ -280,6 +308,9 @@ def _build_llm_client(base_url: str, api_key: str) -> OpenAI:
 
     显式传参取代旧的「进程级 env + 全局单例」方案，避免并发任务串号、
     以及换配置后复用旧 client 的问题。
+
+    timeout 显式传入(默认 120s),覆盖 OpenAI SDK 默认的 600s,让过载端点的
+    单请求快速失败,由 checkpoint 持久化 + 重试机制兜底,而非干等 10 分钟。
     """
     if not base_url or not api_key:
         raise ValueError("base_url and api_key are required to build an LLM client")
@@ -287,6 +318,7 @@ def _build_llm_client(base_url: str, api_key: str) -> OpenAI:
         base_url=normalize_base_url(base_url),
         api_key=api_key,
         http_client=create_logging_http_client(),
+        timeout=_get_request_timeout(),
     )
 
 

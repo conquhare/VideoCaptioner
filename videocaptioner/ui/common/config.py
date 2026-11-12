@@ -95,6 +95,13 @@ class Config(QConfig):
     # 交由批级/UI 重试兜底)
     llm_max_retries = RangeConfigItem("LLM", "MaxRetries", 4, RangeValidator(1, 10))
 
+    # 单个 LLM 请求的超时时间(秒,默认 120)。OpenAI SDK 默认 600s(10 分钟),
+    # 过载端点会把每个请求拖满 10 分钟才报错,导致批处理整体耗时失控。
+    # 默认 120s 让过载请求快速失败,由 checkpoint 持久化 + 重试机制兜底。
+    llm_request_timeout = RangeConfigItem(
+        "LLM", "RequestTimeout", 120, RangeValidator(10, 600)
+    )
+
     # 思考力度(reasoning_effort):控制 LLM 思考强度, none=关闭思考(最快)
     llm_reasoning_effort = OptionsConfigItem(
         "LLM", "ReasoningEffort", "none",
