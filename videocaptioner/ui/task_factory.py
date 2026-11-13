@@ -1,8 +1,10 @@
 import datetime
+import re
 from pathlib import Path
 from typing import Optional
 
 from videocaptioner.config import MODEL_PATH
+from videocaptioner.core.llm.client import normalize_base_url
 from videocaptioner.core.entities import (
     LANGUAGES,
     FullProcessTask,
@@ -19,6 +21,33 @@ from videocaptioner.ui.common.config import cfg
 
 
 class TaskFactory:
+    """任务工厂：把 UI 配置(cfg) 转换成 core 层任务对象。"""
+
+    @staticmethod
+    def get_current_llm_triplet() -> tuple:
+        """按「当前实时 cfg.llm_service」取对应 LLM 三元组 (base_url, api_key, llm_model)。
+
+        供两处共用，确保「测试连接」与「实际执行」读到同一份实时配置，
+        消除 worker 依赖「建 task 时冻结快照」导致的配置过期/误报未配置问题。
+        """
+        current_service = cfg.llm_service.value
+        llm_cfg = {
+            LLMServiceEnum.OPENAI: (cfg.openai_api_base, cfg.openai_api_key, cfg.openai_model),
+            LLMServiceEnum.SILICON_CLOUD: (cfg.silicon_cloud_api_base, cfg.silicon_cloud_api_key, cfg.silicon_cloud_model),
+            LLMServiceEnum.DEEPSEEK: (cfg.deepseek_api_base, cfg.deepseek_api_key, cfg.deepseek_model),
+            LLMServiceEnum.OLLAMA: (cfg.ollama_api_base, cfg.ollama_api_key, cfg.ollama_model),
+            LLMServiceEnum.LM_STUDIO: (cfg.lm_studio_api_base, cfg.lm_studio_api_key, cfg.lm_studio_model),
+            LLMServiceEnum.GEMINI: (cfg.gemini_api_base, cfg.gemini_api_key, cfg.gemini_model),
+            LLMServiceEnum.CHATGLM: (cfg.chatglm_api_base, cfg.chatglm_api_key, cfg.chatglm_model),
+        }
+        base_cfg, key_cfg, model_cfg = llm_cfg.get(current_service, (None, None, None))
+        base_url = base_cfg.value if base_cfg else ""
+        if base_url:
+            base_url = normalize_base_url(base_url)
+        api_key = key_cfg.value if key_cfg else ""
+        llm_model = model_cfg.value if model_cfg else ""
+        return base_url, api_key, llm_model
+
     """任务工厂类，用于创建各种类型的任务"""
 
     @staticmethod
@@ -114,9 +143,19 @@ class TaskFactory:
         task_id: Optional[str] = None,
     ) -> SubtitleTask:
         """创建字幕任务"""
-        output_name = (
-            Path(file_path).stem.replace("【原始字幕】", "").replace("【下载字幕】", "")
-        )
+        # 统一命名基准：全流程任务(video_path 存在)时，4 布局成品 srt 以视频文件名为基准
+        # (见 subtitle_thread.py 第4步 `video_path.stem-{布局}.srt`)。样式字幕/普通字幕输出也
+        # 应对齐到同一核心名，避免同一集出现「视频名-{布局}.srt」与「字幕名-{翻译服务}.ass」
+        # 两种命名基准，导致成品与样式字幕路径看起来不统一。
+        # 无 video_path(如单集界面直接处理字幕文件)时，回退到字幕文件名并剥离系统前缀。
+        if video_path:
+            output_name = Path(video_path).stem
+        else:
+            # 剥离输入文件名中残留的所有系统前缀标记（【原始字幕】/【下载字幕】/【样式字幕】/【字幕】），
+            # 避免对已处理过的字幕文件再次优化/翻译时，输出名出现重复前缀（如「【字幕】【样式字幕】...」）。
+            # 使用「锚定到文件名开头 + 全局匹配」的正则，可按任意顺序、以任意层数剥离这些标记。
+            _PREFIXES = "原始字幕|下载字幕|样式字幕|字幕"
+            output_name = re.sub(rf"^(?:【(?:{_PREFIXES})】)+", "", Path(file_path).stem)
         # 只在需要翻译时添加翻译服务后缀
         suffix = (
             f"-{cfg.translator_service.value.value}" if cfg.need_translate.value else ""
@@ -131,40 +170,8 @@ class TaskFactory:
                 Path(file_path).parent / f"【字幕】{output_name}{suffix}.srt"
             )
 
-        # 根据当前选择的LLM服务获取对应的配置
-        current_service = cfg.llm_service.value
-        if current_service == LLMServiceEnum.OPENAI:
-            base_url = cfg.openai_api_base.value
-            api_key = cfg.openai_api_key.value
-            llm_model = cfg.openai_model.value
-        elif current_service == LLMServiceEnum.SILICON_CLOUD:
-            base_url = cfg.silicon_cloud_api_base.value
-            api_key = cfg.silicon_cloud_api_key.value
-            llm_model = cfg.silicon_cloud_model.value
-        elif current_service == LLMServiceEnum.DEEPSEEK:
-            base_url = cfg.deepseek_api_base.value
-            api_key = cfg.deepseek_api_key.value
-            llm_model = cfg.deepseek_model.value
-        elif current_service == LLMServiceEnum.OLLAMA:
-            base_url = cfg.ollama_api_base.value
-            api_key = cfg.ollama_api_key.value
-            llm_model = cfg.ollama_model.value
-        elif current_service == LLMServiceEnum.LM_STUDIO:
-            base_url = cfg.lm_studio_api_base.value
-            api_key = cfg.lm_studio_api_key.value
-            llm_model = cfg.lm_studio_model.value
-        elif current_service == LLMServiceEnum.GEMINI:
-            base_url = cfg.gemini_api_base.value
-            api_key = cfg.gemini_api_key.value
-            llm_model = cfg.gemini_model.value
-        elif current_service == LLMServiceEnum.CHATGLM:
-            base_url = cfg.chatglm_api_base.value
-            api_key = cfg.chatglm_api_key.value
-            llm_model = cfg.chatglm_model.value
-        else:
-            base_url = ""
-            api_key = ""
-            llm_model = ""
+        # 根据当前选择的LLM服务获取对应的配置（复用公共方法，与 worker 实时刷新同源）
+        base_url, api_key, llm_model = TaskFactory.get_current_llm_triplet()
 
         config = SubtitleConfig(
             # 翻译配置
@@ -191,6 +198,8 @@ class TaskFactory:
             target_language=cfg.target_language.value,
             # 字幕提示
             custom_prompt_text=cfg.custom_prompt_text.value,
+            # 思考力度
+            reasoning_effort=cfg.llm_reasoning_effort.value,
         )
 
         task = SubtitleTask(

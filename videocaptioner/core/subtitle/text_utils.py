@@ -1,23 +1,9 @@
 """Text processing utilities"""
 
-import re
 from typing import List, Tuple
 
+from ..utils.text_utils import is_mainly_cjk
 from .font_utils import FontType
-
-# CJK and Asian languages without spaces
-_NO_SPACE_LANGUAGES = r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff\u0900-\u0dff]"
-
-
-def is_mainly_cjk(text: str, threshold: float = 0.5) -> bool:
-    """Check if text is mainly CJK or Asian languages without spaces"""
-    if not text:
-        return False
-
-    no_space_count = len(re.findall(_NO_SPACE_LANGUAGES, text))
-    total_chars = len("".join(text.split()))
-
-    return no_space_count / total_chars > threshold if total_chars > 0 else False
 
 
 def hex_to_rgba(hex_color: str) -> Tuple[int, int, int, int]:

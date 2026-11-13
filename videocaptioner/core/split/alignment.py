@@ -180,33 +180,3 @@ class SubtitleAligner:
             if not text:
                 text = ""
         return self.line_numbers[side], text
-
-
-if __name__ == "__main__":
-    # 简短示例
-    text1 = ["ab", "b", "c", "d", "e", "f", "g", "h", "i"]
-    text2 = ["a", "b", "c", "d", "f", "g", "h", "i"]
-
-    # 使用示例
-    text_aligner = SubtitleAligner()
-
-    aligned_source, aligned_target = text_aligner.align_texts(text1, text2)
-
-    print("Aligned Source:", len(aligned_source))
-    print("Aligned Target:", len(aligned_target))
-    print(aligned_source)
-    print(aligned_target)
-
-    i = 1
-    for l1, l2 in zip(aligned_source, aligned_target):
-        print(f"行 {i}:")
-        print(f"文本1: {l1}")
-        print(f"文本2: {l2}")
-        print(difflib.SequenceMatcher(None, l1, l2).ratio())
-        print("----")
-        i += 1
-
-    # d = difflib.HtmlDiff()
-    # html = d.make_file(text1, text2)
-    # with open('../output/diff.html', 'w', encoding='utf-8') as f:
-    #     f.write(html)

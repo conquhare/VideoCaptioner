@@ -91,6 +91,8 @@ def video2audio(input_file: str, output: str = "", audio_track_index: int = 0) -
         "1",  # 单声道
         "-ar",
         "16000",  # 采样率16kHz
+        "-af",
+        "aresample=async=1",  # 修复直播流时间戳不连续导致 faster-whisper 内部 ffmpeg_audio() 加载失败
         "-y",
         output,
     ]

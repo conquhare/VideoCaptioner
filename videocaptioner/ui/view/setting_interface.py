@@ -622,6 +622,7 @@ class SettingInterface(ScrollArea):
             self.tr(
                 "控制 LLM 思考强度: none=关闭思考(最快), low/medium/high/max 思考越深越慢"
             ),
+            texts=list(cfg.llm_reasoning_effort.validator.options),  # type: ignore
             parent=self.llmGroup,
         )
 

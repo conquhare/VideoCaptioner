@@ -47,3 +47,9 @@ docs/.vitepress/dist/
 .claude/
 CLAUDE.md
 videocaptioner/_version.py
+
+# WorkBuddy 本地工作记忆(私人对话/配置, 禁止公开)
+.workbuddy/
+
+# 私人翻译提示词(含个人定制内容, 禁止公开)
+翻译提示词.txt

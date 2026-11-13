@@ -27,6 +27,9 @@ class LLMTranslator(BaseTranslator):
         custom_prompt: str,
         is_reflect: bool,
         update_callback: Optional[Callable],
+        base_url: str = "",
+        api_key: str = "",
+        reasoning_effort: str = "none",
     ):
         super().__init__(
             thread_num=thread_num,
@@ -38,6 +41,9 @@ class LLMTranslator(BaseTranslator):
         self.model = model
         self.custom_prompt = custom_prompt
         self.is_reflect = is_reflect
+        self.base_url = base_url
+        self.api_key = api_key
+        self.reasoning_effort = reasoning_effort
 
     def _translate_chunk(
         self, subtitle_chunk: List[SubtitleProcessData]
@@ -108,7 +114,13 @@ class LLMTranslator(BaseTranslator):
         last_response_dict = None
         # llm 反馈循环
         for _ in range(self.MAX_STEPS):
-            response = call_llm(messages=messages, model=self.model)
+            response = call_llm(
+                messages=messages,
+                model=self.model,
+                base_url=self.base_url,
+                api_key=self.api_key,
+                reasoning_effort=self.reasoning_effort,
+            )
             response_dict = json_repair.loads(
                 response.choices[0].message.content.strip()
             )
@@ -205,6 +217,9 @@ class LLMTranslator(BaseTranslator):
                     ],
                     model=self.model,
                     temperature=0.7,
+                    base_url=self.base_url,
+                    api_key=self.api_key,
+                    reasoning_effort=self.reasoning_effort,
                 )
                 translated_text = response.choices[0].message.content.strip()
                 data.translated_text = translated_text
