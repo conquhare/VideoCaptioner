@@ -272,15 +272,3 @@ def detect_whisper_executable() -> str:
 
     # Neither found
     raise RuntimeError("Neither 'whisper-cli' nor 'whisper-cpp' found in PATH. ")
-
-
-if __name__ == "__main__":
-    # 简短示例
-    asr = WhisperCppASR(
-        audio_input="audio.mp3",
-        whisper_model="tiny",
-        whisper_cpp_path="bin/whisper-cpp.exe",
-        language="en",
-        need_word_time_stamp=True,
-    )
-    asr_data = asr._run(callback=print)

@@ -189,11 +189,3 @@ class BcutASR(BaseASR):
                 ASRDataSeg(u["transcript"], u["start_time"], u["end_time"])
                 for u in resp_data["utterances"]
             ]
-
-
-if __name__ == "__main__":
-    # Example usage
-    audio_file = r"test.mp3"
-    asr = BcutASR(audio_file)
-    asr_data = asr.run()
-    print(asr_data)

@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Union
+from collections import deque
 
 try:
     import GPUtil
@@ -118,6 +119,13 @@ class FasterWhisperASR(BaseASR):
     def _build_command(self, audio_input: str) -> List[str]:
         """Build command line arguments for faster-whisper."""
 
+        # 防御性归一：r245.3+ 的 --language 枚举已不含 "auto"，
+        # 若某入口漏传字面量 "auto" 会让新二进制直接报"未知语言"错误；
+        # 归一为空串后，下方 `if self.language:` 判假 → 不传 -l，
+        # 由二进制走原生自动检测（help 明确"未指定 --language 时用 auto"）。
+        if self.language == "auto":
+            self.language = ""
+
         cmd = [
             str(self.faster_whisper_program),
             "-m",
@@ -161,7 +169,12 @@ class FasterWhisperASR(BaseASR):
         if self.ff_mdx_kim2 and self.faster_whisper_program.startswith(
             "faster-whisper-xxl"
         ):
-            cmd.append("--ff_mdx_kim2")
+            # r245.3+ 将参数重命名：--ff_mdx_kim2 -> --ff_vocal_extract mdx_kim2
+            #                  --mdx_device    -> --voc_device
+            cmd.extend(["--ff_vocal_extract", "mdx_kim2"])
+            # MDX 默认会无视 -d 强制走 CUDA，小显存(如 T400 4G)会 OOM；
+            # 显式跟随用户选择的设备，避免静默 CUDA OOM
+            cmd.extend(["--voc_device", self.device])
 
         # 文本处理参数
         if self.one_word:
@@ -248,7 +261,7 @@ class FasterWhisperASR(BaseASR):
 
             cmd = self._build_command(str(wav_path))
 
-            logger.debug("Faster Whisper command: %s", " ".join(cmd))
+            logger.info("Faster Whisper command: %s", " ".join(cmd))
             callback(*ASRStatus.TRANSCRIBING.with_progress(5))
 
             self.process = subprocess.Popen(
@@ -267,6 +280,7 @@ class FasterWhisperASR(BaseASR):
 
             is_finish = False
             error_msg = ""
+            tail_buffer = deque(maxlen=40)  # 保留最近 40 行输出，失败时兜底展示
             last_progress = 0
 
             # 实时处理输出
@@ -277,10 +291,11 @@ class FasterWhisperASR(BaseASR):
                     for stream_name, line in reader.get_remaining_output():
                         line = line.strip()
                         if line:
-                            if "error" in line:
+                            tail_buffer.append(line)
+                            if "error" in line.lower():
                                 error_msg += line
                             else:
-                                logger.debug(line)
+                                logger.info(line)
                     break
 
                 # Reading输出
@@ -289,6 +304,7 @@ class FasterWhisperASR(BaseASR):
                     stream_name, line = output
                     line = line.strip()
                     if line:
+                        tail_buffer.append(line)
                         # 解析进度百分比
                         if match := re.search(r"(\d+)%", line):
                             progress = int(match.group(1))
@@ -306,18 +322,22 @@ class FasterWhisperASR(BaseASR):
                             error_msg += line
                             logger.error(line)
                         else:
-                            logger.debug(line)
+                            logger.info(line)
 
             if not is_finish:
-                logger.error("Faster Whisper Error: %s", error_msg)
-                raise RuntimeError(error_msg)
+                # 兜底：若 error_msg 为空（崩溃信息不含 error 字样，如 CUDA OOM / Traceback），
+                # 则把最近 40 行真实输出作为错误信息，确保用户能看到细节
+                tail_text = "\n".join(tail_buffer)
+                detail = error_msg or tail_text
+                logger.error("Faster Whisper Error: %s", detail)
+                raise RuntimeError(detail)
 
             # 判断是否识别成功
             if not output_path.exists():
-                logger.debug("Faster Whisper 返回值: %s", self.process.returncode)
+                logger.info("Faster Whisper 返回值: %s", self.process.returncode)
                 raise RuntimeError(f"Faster Whisper 输出文件不存在: {output_path}")
 
-            logger.debug("Faster Whisper ASR completed")
+            logger.info("Faster Whisper ASR completed")
 
             callback(*ASRStatus.COMPLETED.callback_tuple())
 
