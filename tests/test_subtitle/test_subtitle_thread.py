@@ -9,6 +9,7 @@ This module tests the subtitle processing thread which handles:
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PyQt5.QtCore import QEventLoop, QTimer
@@ -124,6 +125,75 @@ def base_config():
         need_translate=False,
         thread_num=2,
         batch_size=5,
+    )
+
+
+def _make_fake_response(content: str):
+    """Build a minimal OpenAI-style response object."""
+    message = SimpleNamespace(content=content)
+    choice = SimpleNamespace(message=message)
+    return SimpleNamespace(choices=[choice])
+
+
+def _echo_llm_response(messages, model, temperature=1, **kwargs):
+    """Fake call_llm: echo back the JSON dict sent in the last user message.
+
+    Works for both the optimizer (expects {index: text}) and the LLM
+    translator (expects {index: text}); returning the input unchanged
+    satisfies key-match and similarity validation without any network.
+    """
+    content = ""
+    if messages:
+        content = messages[-1].get("content", "")
+    return _make_fake_response(content)
+
+
+def _fake_split_by_llm(text, model="gpt-4o-mini", max_word_count_cjk=18,
+                       max_word_count_english=12, **kwargs):
+    """Fake split_by_llm: split on spaces with <br> tags (no network).
+
+    Produces a valid split result (content unchanged, each segment short)
+    so SubtitleSplitter's validation passes deterministically offline.
+    """
+    tokens = text.split(" ")
+    return [t for t in tokens if t]
+
+
+@pytest.fixture
+def mock_llm_client(monkeypatch):
+    """Stub out all real LLM network calls for SubtitleThread tests.
+
+    - check_llm_connection (imported into subtitle_thread) -> always succeeds
+    - call_llm used by SubtitleOptimizer -> returns the echoed JSON dict
+    - call_llm used by LLMTranslator -> same echo behaviour
+    - split_by_llm used by SubtitleSplitter -> deterministic offline split
+
+    Also seeds dummy OPENAI_* env vars so tests that read them via
+    os.getenv(...) build a "valid" LLM config (no real key needed, since
+    check_llm_connection is stubbed).
+    """
+    from videocaptioner.core.optimize import optimize as optimize_module
+    from videocaptioner.core.split import split as split_module
+    from videocaptioner.core.translate import llm_translator as llm_translator_module
+    from videocaptioner.ui.thread import subtitle_thread as subtitle_thread_module
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-dummy-key")
+    monkeypatch.setenv("OPENAI_MODEL", "test-model")
+
+    monkeypatch.setattr(
+        subtitle_thread_module,
+        "check_llm_connection",
+        lambda base_url, api_key, model: (True, "ok"),
+    )
+    monkeypatch.setattr(
+        optimize_module, "call_llm", _echo_llm_response
+    )
+    monkeypatch.setattr(
+        llm_translator_module, "call_llm", _echo_llm_response
+    )
+    monkeypatch.setattr(
+        split_module, "split_by_llm", _fake_split_by_llm
     )
 
 

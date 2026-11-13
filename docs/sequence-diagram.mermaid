@@ -1,0 +1,39 @@
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant UI as SubtitleInterface
+    participant ST as SubtitleThread
+    participant OPT as SubtitleOptimizer
+    participant LLM as LLM API
+    participant M as SubtitleTableModel
+    participant RT as RetryThread
+
+    U->>UI: 点击「开始」
+    UI->>ST: start()
+    ST->>OPT: optimize_subtitle(asr_data) [failure_callback=collect]
+    par 并发批次
+        OPT->>LLM: 优化 chunk1..N
+        LLM-->>OPT: chunk1 成功
+        OPT-->>ST: update_callback(成功项)
+        ST-->>UI: update(dict) → M.update_data
+    and
+        LLM-->>OPT: chunk5 抛异常(自动重试仍失败)
+        OPT->>OPT: chunk5 indices 打 FAILED
+        OPT-->>ST: failure_callback(SubtitleFailure{5, OPTIMIZE})
+        ST-->>UI: degraded.emit([failure])
+        UI->>M: set_failure_markers([5]) → 行标红
+    end
+    ST-->>UI: finished.emit
+    UI->>UI: asr_data.has_failure()=True
+    UI-->>U: InfoBar.warning「1 项失败，可重试」 + 工具条「重试全部失败项(1)」
+
+    U->>UI: 点击「重试全部失败项(1)」
+    UI->>UI: 置灰开始/重试按钮(锁定编辑)
+    UI->>RT: new RetryThread(OPTIMIZE, indices=[5], thread_num=1); start()
+    RT->>OPT: retry_optimize(asr_data_subset, [5])
+    OPT->>LLM: 只发 index=5（成功项不参与=幂等）
+    LLM-->>OPT: index5 优化成功
+    OPT-->>RT: 回填 index5 文本 + 状态 SUCCESS
+    RT-->>UI: finished({5: new_text})
+    UI->>M: update_data({5:new_text}) + 清除 index5 失败标记
+    UI-->>U: InfoBar.success「重试完成」 + 解锁编辑

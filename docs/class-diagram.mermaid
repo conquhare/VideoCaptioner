@@ -1,0 +1,70 @@
+classDiagram
+    class ProcessStage { <<enum>> SPLIT OPTIMIZE TRANSLATE }
+    class SubtitleStatus { <<enum>> PENDING SUCCESS FAILED RETRYING }
+    class FatalErrorType { <<enum>> NONE AUTH_QUOTA SERVICE NETWORK UNKNOWN }
+
+    class SubtitleFailure {
+        +List~int~ indices
+        +ProcessStage stage
+        +str message
+        +chunk_source
+    }
+    class SubtitleProcessData {
+        +int index
+        +str original_text
+        +str translated_text
+        +str optimized_text
+    }
+
+    class ASRDataSeg {
+        +str text
+        +str translated_text
+        +int start_time
+        +int end_time
+        +Dict~ProcessStage,SubtitleStatus~ process_status
+        +str error_message
+        +bool user_edited
+        +Optional~int~ source_chunk_id
+    }
+    class ASRData {
+        +List~ASRDataSeg~ segments
+        +to_json() dict
+        +from_json(d)$ ASRData
+        +failed_indices(stage) List~int~
+        +count_failed(stage) int
+        +has_failure() bool
+    }
+    ASRData "1" o-- "many" ASRDataSeg
+
+    class SubtitleOptimizer {
+        +failure_callback
+        +retry_optimize(asr_data, indices) ASRData
+        -_parallel_optimize(chunks)
+    }
+    class SubtitleSplitter {
+        +failure_callback
+        -_chunk_sources: Dict
+        +retry_split(asr_data, chunk_ids) ASRData
+    }
+    class BaseTranslator {
+        +failure_callback
+        +retry_translate(asr_data, indices) ASRData
+    }
+
+    class SubtitleThread { <<QThread>> degraded=pyqtSignal(object) fatal=pyqtSignal(str,str) }
+    class RetryThread { <<QThread>> op stage indices degraded=pyqtSignal(object) }
+    class SubtitleTableModel { _data set_failure_markers() }
+    class SubtitleInterface { retry_all_failed() on_degraded() on_fatal() }
+
+    SubtitleOptimizer ..> SubtitleFailure : 产生
+    SubtitleSplitter ..> SubtitleFailure : 产生
+    BaseTranslator ..> SubtitleFailure : 产生
+    SubtitleOptimizer ..> SubtitleProcessData : 回填成功
+    ASRDataSeg --> ProcessStage
+    ASRDataSeg --> SubtitleStatus
+    SubtitleThread --> SubtitleFailure : 发射 degraded
+    RetryThread --> SubtitleOptimizer : 重试优化
+    RetryThread --> BaseTranslator : 重试翻译
+    RetryThread --> SubtitleSplitter : 重试断句
+    SubtitleInterface --> RetryThread : 发起重试
+    SubtitleInterface --> SubtitleTableModel

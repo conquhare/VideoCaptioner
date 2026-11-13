@@ -2,7 +2,7 @@ import datetime
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Literal, Optional
+from typing import TYPE_CHECKING, Any, List, Literal, Optional
 
 if TYPE_CHECKING:
     from videocaptioner.core.translate.types import TargetLanguage
@@ -21,6 +21,37 @@ class SubtitleProcessData:
     original_text: str
     translated_text: str = ""
     optimized_text: str = ""
+
+
+class ProcessStage(str, Enum):
+    """处理阶段，失败按阶段记录"""
+
+    SPLIT = "split"
+    OPTIMIZE = "optimize"
+    TRANSLATE = "translate"
+
+
+class SubtitleStatus(str, Enum):
+    """单条字幕在某阶段的状态"""
+
+    PENDING = "pending"  # 未处理（默认）
+    SUCCESS = "success"  # 处理成功
+    FAILED = "failed"  # 降级失败（主流程继续）
+    RETRYING = "retrying"  # 手动重试中
+
+
+@dataclass
+class SubtitleFailure:
+    """一次降级失败的记录，用于跨线程上报与 UI 标注。
+
+    与 `SubtitleProcessData`（成功项回填载体）对称的失败项上报载体。
+    """
+
+    indices: List[int]  # 受影响的字幕 index（1-based，与 ASRData.segments 对应）
+    stage: ProcessStage
+    message: str = ""
+    # 断句失败额外携带：受影响 chunk 的源 word 级数据，供整段重试
+    chunk_source: Optional[Any] = None
 
 
 class SupportedAudioFormats(Enum):
@@ -645,6 +676,9 @@ class SubtitleConfig:
     target_language: Optional["TargetLanguage"] = None
     subtitle_style: Optional[str] = None
     custom_prompt_text: Optional[str] = None
+
+    # 思考力度(reasoning_effort):none=关闭思考(最快)
+    reasoning_effort: Optional[str] = "none"
 
     def _mask_key(self, key: Optional[str]) -> str:
         """Mask sensitive key for display"""

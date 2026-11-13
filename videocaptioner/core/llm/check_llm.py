@@ -5,6 +5,9 @@ from typing import Literal, Optional
 import openai
 
 from videocaptioner.core.llm.client import normalize_base_url
+from videocaptioner.core.utils.logger import setup_logger
+
+logger = setup_logger("llm_check")
 
 
 def check_llm_connection(
@@ -37,8 +40,16 @@ def check_llm_connection(
             timeout=30,
         )
         return True, response.choices[0].message.content
-    except openai.APIConnectionError:
-        return False, "API Connection Error. Please check your network or VPN."
+    except openai.APIConnectionError as e:
+        # 把真实连接错误详情写进日志，避免只暴露一句"请检查网络或 VPN"
+        logger.warning(
+            "LLM connection failed for %s: %s (cause: %s)",
+            base_url,
+            e,
+            getattr(e, "__cause__", None),
+            exc_info=True,
+        )
+        return False, f"API Connection Error: {e}. Please check your network, proxy or VPN."
     except openai.RateLimitError as e:
         return False, "Rate Limit Error: " + str(e)
     except openai.AuthenticationError:

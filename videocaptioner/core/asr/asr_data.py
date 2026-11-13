@@ -4,11 +4,11 @@ import os
 import platform
 import re
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from langdetect import LangDetectException, detect
 
-from ..entities import SubtitleLayoutEnum
+from ..entities import ProcessStage, SubtitleLayoutEnum, SubtitleStatus
 from ..utils.text_utils import is_mainly_cjk
 
 # 多语言分词模式(支持词级和字符级语言)
@@ -57,6 +57,12 @@ class ASRDataSeg:
         self.translated_text = translated_text
         self.start_time = start_time
         self.end_time = end_time
+        # 每阶段状态：{ProcessStage.OPTIMIZE: SubtitleStatus.FAILED, ...}
+        # 只记录「已被处理过的阶段」，未出现的阶段视为 PENDING
+        self.process_status: Dict[ProcessStage, SubtitleStatus] = {}
+        self.error_message: str = ""  # 最近一次失败原因（可选，用于 tooltip）
+        self.user_edited: bool = False  # 用户是否手动编辑过（支撑断句重试覆盖确认）
+        self.source_chunk_id: Optional[int] = None  # 断句阶段：本条来自哪个 chunk
 
     def to_srt_ts(self) -> str:
         """Convert to SRT timestamp format"""
@@ -225,6 +231,11 @@ class ASRData:
     ) -> None:
         """Save ASRData to file in specified format.
 
+        Format is chosen strictly by extension, so SRT content always lands in
+        ``.srt`` and ASS content in ``.ass``. Content is fully serialized in
+        memory *before* the file is opened, so a serialization failure can never
+        leave behind a truncated/0-byte stub.
+
         Args:
             save_path: Output file path
             ass_style: ASS style string (optional, uses default if None)
@@ -233,17 +244,21 @@ class ASRData:
         save_path = handle_long_path(save_path)
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
 
+        # 先在内存中完成序列化（不传 save_path，各 to_* 只返回字符串），再统一落盘。
+        # 这样写入是原子的：序列化抛异常时不会先截断目标文件、留下 0KB 空壳。
         if save_path.endswith(".srt"):
-            self.to_srt(save_path=save_path, layout=layout)
+            content = self.to_srt(layout=layout)
         elif save_path.endswith(".txt"):
-            self.to_txt(save_path=save_path, layout=layout)
+            content = self.to_txt(layout=layout)
         elif save_path.endswith(".json"):
-            with open(save_path, "w", encoding="utf-8") as f:
-                json.dump(self.to_json(), f, ensure_ascii=False, indent=2)
+            content = json.dumps(self.to_json(), ensure_ascii=False, indent=2)
         elif save_path.endswith(".ass"):
-            self.to_ass(save_path=save_path, style_str=ass_style, layout=layout)
+            content = self.to_ass(style_str=ass_style, layout=layout)
         else:
             raise ValueError(f"Unsupported file extension: {save_path}")
+
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(content)
 
     def to_txt(
         self,
@@ -309,11 +324,19 @@ class ASRData:
         """Convert to JSON format"""
         result_json = {}
         for i, segment in enumerate(self.segments, 1):
+            # 仅序列化 FAILED 状态（成功为默认，减小 JSON 体积）
+            failed_stages = [
+                stage.value
+                for stage, status in segment.process_status.items()
+                if status == SubtitleStatus.FAILED
+            ]
             result_json[str(i)] = {
                 "start_time": segment.start_time,
                 "end_time": segment.end_time,
                 "original_subtitle": segment.text,
                 "translated_subtitle": segment.translated_text,
+                "failed_stages": failed_stages,
+                "error_message": segment.error_message,
             }
         return result_json
 
@@ -561,8 +584,36 @@ class ASRData:
                 start_time=segment_data["start_time"],
                 end_time=segment_data["end_time"],
             )
+            # 向后兼容：旧 JSON 无这些字段时缺省为空
+            for stage_value in segment_data.get("failed_stages", []):
+                try:
+                    stage = ProcessStage(stage_value)
+                except ValueError:
+                    continue
+                segment.process_status[stage] = SubtitleStatus.FAILED
+            segment.error_message = segment_data.get("error_message", "")
             segments.append(segment)
         return ASRData(segments)
+
+    def failed_indices(self, stage: ProcessStage) -> List[int]:
+        """取某阶段失败项的 1-based index 列表（幂等重试的核心查询）。"""
+        return [
+            i
+            for i, seg in enumerate(self.segments, 1)
+            if seg.process_status.get(stage) == SubtitleStatus.FAILED
+        ]
+
+    def count_failed(self, stage: ProcessStage) -> int:
+        """统计某阶段失败数量（供 UI 汇总按钮 "重试全部失败项(N)"）。"""
+        return len(self.failed_indices(stage))
+
+    def has_failure(self) -> bool:
+        """任一阶段有 FAILED 即为 True。"""
+        return any(
+            status == SubtitleStatus.FAILED
+            for seg in self.segments
+            for status in seg.process_status.values()
+        )
 
     @staticmethod
     def from_srt(srt_str: str) -> "ASRData":

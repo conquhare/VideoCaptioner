@@ -7,6 +7,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from videocaptioner.core.asr.asr_data import ASRData
 from videocaptioner.core.entities import (
     SubtitleConfig,
+    SubtitleFailure,
     SubtitleLayoutEnum,
     SubtitleProcessData,
     SubtitleTask,
@@ -23,6 +24,7 @@ from videocaptioner.core.optimize.optimize import SubtitleOptimizer
 from videocaptioner.core.split.split import SubtitleSplitter
 from videocaptioner.core.translate.factory import TranslatorFactory
 from videocaptioner.core.translate.types import TranslatorType
+from videocaptioner.core.utils.error_classifier import classify_error
 from videocaptioner.core.utils.logger import setup_logger
 
 SERVICE_TO_TYPE = {
@@ -57,6 +59,9 @@ def create_translator_from_config(
         custom_prompt=custom_prompt,
         is_reflect=config.need_reflect,
         update_callback=callback,
+        base_url=config.base_url or "",
+        api_key=config.api_key or "",
+        reasoning_effort=config.reasoning_effort or "none",
     )
 
 
@@ -66,6 +71,10 @@ class SubtitleThread(QThread):
     update = pyqtSignal(dict)
     update_all = pyqtSignal(dict)
     error = pyqtSignal(str)
+    # 子任务降级失败集合（List[SubtitleFailure]），逐条实时发射供 UI 即时标注
+    degraded = pyqtSignal(object)
+    # 致命失败 (error_text, FatalErrorType.value)，供 UI 据类型定制文案/是否禁用重试
+    fatal = pyqtSignal(str, str)
 
     def __init__(self, task: SubtitleTask):
         super().__init__()
@@ -74,16 +83,42 @@ class SubtitleThread(QThread):
         self.finished_subtitle_length = 0
         self.custom_prompt_text = ""
         self.optimizer = None
+        # 累积本次运行的所有降级失败项，供结束后汇总
+        self._failures: List[SubtitleFailure] = []
+
+    def _collect_failure(self, failure: SubtitleFailure) -> None:
+        """failure_callback 落地：累积失败项并实时逐条发射。"""
+        self._failures.append(failure)
+        self.degraded.emit([failure])
 
     def set_custom_prompt_text(self, text: str):
         self.custom_prompt_text = text
 
     def _setup_llm_config(self) -> SubtitleConfig:
-        """验证 LLM 配置并设置环境变量，返回 SubtitleConfig"""
+        """校验 LLM 配置可用性并返回刷新后的 SubtitleConfig。
+
+        凭据经显式传参流向 call_llm（不再写进程级 env / 全局单例），
+        此处仅做连接预检，并按实时 cfg 刷新 LLM 三元组以消除快照过期。
+        """
         config = self.task.subtitle_config
         if not config:
-            raise Exception(self.tr("LLM API 未配置, 请检查LLM配置"))
-        if config.base_url and config.api_key and config.llm_model:
+            raise Exception(self.tr("字幕配置为空，无法开始处理"))
+        # 按当前实时 cfg 刷新 LLM 三元组，与「测试连接」/重试同源，消除建 task 时冻结快照的过期问题
+        from videocaptioner.ui.task_factory import TaskFactory
+
+        config.base_url, config.api_key, config.llm_model = (
+            TaskFactory.get_current_llm_triplet()
+        )
+        missing = [
+            name
+            for name, value in (
+                ("API Base", config.base_url),
+                ("API Key", config.api_key),
+                ("Model", config.llm_model),
+            )
+            if not value
+        ]
+        if not missing:
             success, message = check_llm_connection(
                 config.base_url,
                 config.api_key,
@@ -91,11 +126,17 @@ class SubtitleThread(QThread):
             )
             if not success:
                 raise Exception(f"{self.tr('LLM API 测试失败: ')}{message or ''}")
-            os.environ["OPENAI_BASE_URL"] = config.base_url
-            os.environ["OPENAI_API_KEY"] = config.api_key
             return config
-        else:
-            raise Exception(self.tr("LLM API 未配置, 请检查LLM配置"))
+        # 分情况给出可定位的提示，避免「服务未选」与「字段漏填」混为一谈
+        if not config.base_url and not config.api_key and not config.llm_model:
+            raise Exception(
+                self.tr("未选择 LLM 服务，请到「设置 → LLM」选择服务并填写配置")
+            )
+        raise Exception(
+            self.tr("LLM 配置不完整，缺少：{0}，请到「设置 → LLM」补全").format(
+                "、".join(missing)
+            )
+        )
 
     def run(self):
         # 设置任务上下文
@@ -140,6 +181,8 @@ class SubtitleThread(QThread):
                     model=subtitle_config.llm_model,
                     max_word_count_cjk=subtitle_config.max_word_count_cjk,
                     max_word_count_english=subtitle_config.max_word_count_english,
+                    base_url=subtitle_config.base_url or "",
+                    api_key=subtitle_config.api_key or "",
                 )
                 asr_data = splitter.split_subtitle(asr_data)
                 self.update_all.emit(asr_data.to_json())
@@ -162,7 +205,12 @@ class SubtitleThread(QThread):
                     model=subtitle_config.llm_model,
                     custom_prompt=custom_prompt or "",
                     update_callback=self.callback,
+                    failure_callback=self._collect_failure,
+                    base_url=subtitle_config.base_url or "",
+                    api_key=subtitle_config.api_key or "",
+                    reasoning_effort=subtitle_config.reasoning_effort or "none",
                 )
+                self.optimizer = optimizer
                 asr_data = optimizer.optimize_subtitle(asr_data)
                 asr_data.remove_punctuation()
                 self.update_all.emit(asr_data.to_json())
@@ -180,6 +228,8 @@ class SubtitleThread(QThread):
                 translator = create_translator_from_config(
                     subtitle_config, custom_prompt, self.callback
                 )
+                # 工厂不透传 failure_callback，直接在实例上注入（BaseTranslator 已支持该属性）
+                translator.failure_callback = self._collect_failure
 
                 asr_data = translator.translate_subtitle(asr_data)
 
@@ -234,7 +284,11 @@ class SubtitleThread(QThread):
 
         except Exception as e:
             logger.exception(f"字幕处理失败: {str(e)}")
+            # 保持向后兼容的 error 信号
             self.error.emit(str(e))
+            # 新增：带致命类型标注，供 UI 据 FatalErrorType 定制文案/是否禁用重试
+            fatal_type = classify_error(e)
+            self.fatal.emit(str(e), fatal_type.value)
             self.progress.emit(100, self.tr("字幕处理失败"))
         finally:
             clear_task_context()
@@ -328,10 +382,22 @@ class RetranslateThread(QThread):
 
             # 设置 LLM 环境变量（LLM 翻译需要）
             if config.translator_service == TranslatorServiceEnum.OPENAI:
-                if not (config.base_url and config.api_key and config.llm_model):
-                    raise Exception("LLM API 未配置，请检查 LLM 配置")
-                os.environ["OPENAI_BASE_URL"] = config.base_url
-                os.environ["OPENAI_API_KEY"] = config.api_key
+                missing = [
+                    name
+                    for name, value in (
+                        ("API Base", config.base_url),
+                        ("API Key", config.api_key),
+                        ("Model", config.llm_model),
+                    )
+                    if not value
+                ]
+                if missing:
+                    raise Exception(
+                        self.tr("LLM 翻译配置不完整，缺少：{0}，请到「设置 → LLM」补全").format(
+                            "、".join(missing)
+                        )
+                    )
+                # 凭据经 create_translator_from_config 显式传给翻译器，不再写进程级 env
 
             # 构建仅含选中行的 ASRData
             asr_data = ASRData.from_json(self.selected_data)
